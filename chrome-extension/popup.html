@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Hermes Browser Bridge</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <!-- Header: identity + connection state + the two controls that don't
+         belong to "day to day" (reconnect, options) live here so they're
+         always visible no matter which tab strip panel is open. -->
+    <header id="appHeader" class="app-header">
+      <img id="appIcon" class="app-icon" src="icons/icon48.png" alt="" width="32" height="32" />
+      <div class="app-identity">
+        <div class="app-title-row">
+          <span class="app-title">Hermes Bridge</span>
+        </div>
+        <p id="deviceName" class="app-device">—</p>
+      </div>
+      <div class="app-header-actions">
+        <!-- Just a coloured light, no words: green = connected & live, amber =
+             paused or connecting/reconnecting, red = disconnected/error. The
+             wording that used to sit next to it (and the separate "Paused"
+             badge, which overlapped the title on a long device name) now
+             lives entirely in this element's title/aria-label -- sighted and
+             screen-reader users both get the same words, just not painted on
+             the header. statusText/statusDetail stay in the DOM (hidden) so
+             the rest of this file's logic -- and the tooltip text it builds
+             -- doesn't need a second code path. -->
+        <div class="status" id="statusChip" role="img">
+          <span class="dot" id="dot"></span>
+          <span class="status-text sr-only" id="statusText">Checking…</span>
+          <span class="status-detail sr-only" id="statusDetail"></span>
+        </div>
+        <button id="reconnectButton" class="icon-button" type="button" title="Reconnect" aria-label="Reconnect">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 12a9 9 0 0 1 15.3-6.4L21 8" />
+            <path d="M21 3v5h-5" />
+            <path d="M21 12a9 9 0 0 1-15.3 6.4L3 16" />
+            <path d="M3 21v-5h5" />
+          </svg>
+        </button>
+        <button id="optionsButton" class="icon-button" type="button" title="Options" aria-label="Options">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="3" />
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <div id="errorBox" class="error" hidden></div>
+
+    <div class="row" id="cancelConnectRow" hidden>
+      <button id="cancelConnectButton" class="danger">Cancel</button>
+    </div>
+
+    <section id="pairSection" hidden>
+      <div id="onboardStepGateway" class="onboard-step">
+        <p class="onboard-step-label">Step 1 of 2 &middot; Gateway URL</p>
+        <label for="onboardGatewayUrl">Gateway WebSocket URL</label>
+        <input id="onboardGatewayUrl" type="url" placeholder="ws://your-gateway-host:8765/bridge" />
+        <div class="row">
+          <button id="onboardGatewayContinue" class="primary">Continue</button>
+        </div>
+        <p class="hint">
+          Where Hermes' gateway is listening. You can change this later in
+          <a href="#" id="openOptions">Options</a>.
+        </p>
+      </div>
+
+      <div id="onboardStepPair" class="onboard-step" hidden>
+        <p class="onboard-step-label">Step 2 of 2 &middot; Pair this device</p>
+        <p class="hint-inline">On the gateway host, run:</p>
+        <div class="code-row">
+          <code id="pairCommandText">hermes browser-bridge pair</code>
+          <button id="copyPairCommand" type="button">Copy</button>
+        </div>
+        <label for="pairCode">Pairing code</label>
+        <input id="pairCode" type="text" inputmode="numeric" maxlength="6" placeholder="000000" autocomplete="off" />
+        <div class="row">
+          <button id="pairButton" class="primary">Connect</button>
+          <button id="onboardBackToGateway" type="button">Back</button>
+        </div>
+        <p class="hint">
+          Connecting to <code id="onboardGatewayDisplay">&mdash;</code> &mdash; wrong host? Go back and fix it.
+        </p>
+      </div>
+    </section>
+
+    <section id="pairedSection" hidden>
+      <!-- Action row: pause first, since it is the control a user reaches for
+           in a hurry, and a control you reach for in a hurry does not belong
+           below three lists. Share sits next to it because for a freshly
+           paired device with nothing attached yet, sharing is the whole
+           point of opening the popup at all. -->
+      <div class="action-row">
+        <button id="pauseButton" class="primary action-pause">
+          <span id="pauseButtonLabel">Pause Sharing</span>
+          <span id="stopShortcutNote" class="shortcut-hint"></span>
+        </button>
+        <button id="shareActiveButton" class="secondary action-share" hidden>
+          <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+            <path d="M12 5v14M5 12h14" />
+          </svg>
+          <span>Share Tab</span>
+        </button>
+      </div>
+      <p id="shareActiveInfo" class="tab-origin share-active-info sr-only"></p>
+      <div id="shareError" class="error" hidden></div>
+
+      <!-- Attached tabs are always visible, above the tab strip: this is what
+           Hermes can currently see or act in, and it should never require a
+           tab click to check. -->
+      <label class="section-label">Attached tabs</label>
+      <ul id="attachedTabsList" class="attached-cards"></ul>
+      <p id="attachedTabsEmpty" class="hint-inline">No attached tabs. Share a tab for it to show here.</p>
+
+      <!-- Tab strip: Tabs / Credentials / Host &amp; Net. Selection is kept in
+           chrome.storage.session (falling back to localStorage) so reopening
+           the popup lands back where the user left it. -->
+      <div id="tabStrip" class="tab-strip" role="tablist" aria-label="Popup sections">
+        <button id="tabBtnTabs" class="tab-strip-btn" role="tab" type="button" aria-selected="true" aria-controls="panelTabs">
+          <span id="tabsCountLabel">Tabs (0)</span>
+          <span id="tabsApprovalBadge" class="count-badge" hidden></span>
+        </button>
+        <button id="tabBtnCredentials" class="tab-strip-btn" role="tab" type="button" aria-selected="false" aria-controls="panelCredentials" tabindex="-1">Credentials</button>
+        <button id="tabBtnHostNet" class="tab-strip-btn" role="tab" type="button" aria-selected="false" aria-controls="panelHostNet" tabindex="-1">Host / Net</button>
+      </div>
+
+      <!-- The popup is a fixed size no matter which of these three panels is
+           open or how many rows are in it (chrome://extensions resizes the
+           whole popup to fit its content, which made switching tabs or
+           attaching another tab visibly jump the window around). Everything
+           above and below this wrapper is fixed height; this wrapper alone
+           is flex:1 with its own scrollbar, so only the active panel's
+           content ever scrolls. -->
+      <div id="tabPanels" class="tab-panels">
+      <section id="panelTabs" class="tab-panel" role="tabpanel" aria-labelledby="tabBtnTabs">
+        <div class="panel-header-row">
+          <span class="panel-eyebrow">Other open tabs</span>
+          <span class="panel-hint-right">hermes acts only when shared</span>
+        </div>
+        <ul id="shareTabsList" class="tab-list share-tabs-list"></ul>
+        <p id="shareTabsEmpty" class="hint-inline">No other open tabs to share.</p>
+        <p id="shareTabsMore" class="hint-inline" hidden></p>
+
+        <div id="waitingApprovalBox" class="waiting-approval-box">
+          <div id="waitingApprovalHead" class="waiting-approval-head" hidden>
+            <span>Waiting for approval</span>
+            <span id="approvalCount" class="count-badge"></span>
+          </div>
+          <ul id="approvalList" class="approval-list"></ul>
+          <p id="approvalEmpty" class="hint-inline waiting-approval-empty">Waiting for approval: <strong>None pending</strong></p>
+        </div>
+      </section>
+
+      <section id="panelCredentials" class="tab-panel" role="tabpanel" aria-labelledby="tabBtnCredentials" hidden>
+        <!-- G3.7: HTTP sign-in (basic auth). User-only, by design — Hermes can
+             ask "is this site signed in?" (browser_bridge_http_auth_status) but
+             can never see, set, or list a credential itself. Nothing typed
+             here ever reaches the gateway; only the origin + expiry of what's
+             armed does (via auth.status), never the username or password. -->
+        <label>HTTP sign-in <span class="hint-inline">(basic/digest auth prompts)</span></label>
+        <ul id="httpAuthArmedList" class="tab-list"></ul>
+        <p id="httpAuthArmedEmpty" class="hint-inline">No sign-in credentials staged.</p>
+        <div id="httpAuthDisabledNote" class="hint-inline" hidden>
+          Turn on "Read HTTP auth status" under Options &rarr; Powers to stage a credential.
+        </div>
+        <div id="httpAuthForm" class="row-compact httpauth-form">
+          <input id="httpAuthOrigin" type="url" placeholder="https://intranet.example.com" autocomplete="off" />
+          <input id="httpAuthUsername" type="text" placeholder="Username" autocomplete="off" />
+          <input id="httpAuthPassword" type="password" placeholder="Password" autocomplete="new-password" />
+          <input id="httpAuthTtlMinutes" type="number" min="1" max="240" value="15" title="Minutes before this credential expires" />
+          <button id="httpAuthArmButton">Arm</button>
+        </div>
+        <p id="httpAuthError" class="error" hidden></p>
+
+        <!-- G3.6.5: where a cookie the USER already has (copied from another
+             device, a support ticket, a password manager export) belongs — set
+             directly here, entirely locally, with no gateway round trip and
+             nothing sent to the model. Never paste a cookie into chat with the
+             agent: that puts session-authentication material into a
+             transcript, which is exactly what this affordance exists to avoid.
+             This is deliberately separate from browser_bridge_cookie_set (the
+             agent's own tool, gated by allowCookieWrite + the origin bound +
+             approval) -- this is the user acting directly in their own
+             browser. -->
+        <details id="cookiePasteSection" class="cookie-paste">
+          <summary>Paste a cookie for this origin</summary>
+          <p class="hint-inline">
+            For a cookie value you already have and want Hermes' current session to use — never paste a
+            cookie value into chat with the agent instead.
+          </p>
+          <label for="cookiePasteOrigin">Origin</label>
+          <input id="cookiePasteOrigin" type="url" placeholder="https://example.com" autocomplete="off" />
+          <label for="cookiePasteName">Name</label>
+          <input id="cookiePasteName" type="text" autocomplete="off" />
+          <label for="cookiePasteValue">Value</label>
+          <input id="cookiePasteValue" type="password" autocomplete="off" />
+          <div class="row">
+            <label class="hint-inline"><input id="cookiePasteSecure" type="checkbox" checked /> Secure</label>
+            <label class="hint-inline"><input id="cookiePasteHttpOnly" type="checkbox" /> HttpOnly</label>
+          </div>
+          <div class="row">
+            <button id="cookiePasteButton" type="button">Set cookie</button>
+          </div>
+          <p id="cookiePasteResult" class="hint-inline" hidden></p>
+        </details>
+      </section>
+
+      <section id="panelHostNet" class="tab-panel" role="tabpanel" aria-labelledby="tabBtnHostNet" hidden>
+        <p class="hint">Gateway <code id="gatewayUrlLine">—</code></p>
+
+        <!-- Connection and teardown: everything above is what the user does
+             day to day; these are the things they do once, or in an
+             emergency. -->
+        <div class="row row-compact">
+          <button id="hostReconnectButton">Reconnect</button>
+          <button id="disconnectButton">Disconnect</button>
+        </div>
+        <div class="row row-compact">
+          <button id="killButton" class="danger">Release all</button>
+          <button id="unpairButton" class="danger">Unpair</button>
+        </div>
+
+        <!-- G7 (ProjectRules/speedimprovements.md): off by default in Options;
+             this view just lets you scrub through whatever's already been
+             recorded on this device. -->
+        <div class="row">
+          <button id="replayToggle" type="button">Replay</button>
+        </div>
+        <section id="replayView" class="replay-view" hidden>
+          <p id="replayEmpty" class="hint-inline">
+            Nothing recorded yet — turn on "Record agent activity for replay" under Options.
+          </p>
+          <img id="replayFrame" class="replay-frame" alt="Recorded frame" hidden />
+          <input id="replayScrubber" type="range" min="0" max="0" value="0" hidden />
+          <p id="replayCaption" class="hint-inline" hidden></p>
+          <div class="row row-compact">
+            <button id="replayExport" type="button" disabled>Export</button>
+            <button id="replayClear" type="button" class="danger" disabled>Clear</button>
+          </div>
+        </section>
+      </section>
+      </div>
+    </section>
+
+    <!-- Footer: connection at a glance (host:port) on the left, quick links
+         on the right. Always visible, paired or not. -->
+    <footer id="appFooter" class="app-footer">
+      <span class="footer-conn">
+        <span class="dot" id="footerDot"></span>
+        <code id="footerGatewayHost">—</code>
+      </span>
+      <span class="footer-links">
+        <a href="#" id="footerLogs">Logs</a>
+        <span aria-hidden="true">&middot;</span>
+        <a href="#" id="footerShortcuts">Shortcuts</a>
+        <span aria-hidden="true">&middot;</span>
+        <a href="#" id="footerDocs">Docs</a>
+      </span>
+    </footer>
+
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

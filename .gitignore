@@ -1,0 +1,19 @@
+# Local settings, secrets and runtime state -- never commit these
+.env
+.env.*
+*.local
+config.yaml
+config.yaml.bak*
+*.db
+*.db-*
+audit*.jsonl
+*.tgz
+
+# Build and editor noise
+__pycache__/
+*.pyc
+*.map
+node_modules/
+.DS_Store
+.vscode/
+.idea/

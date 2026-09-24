@@ -1,0 +1,960 @@
+:root {
+  color-scheme: dark;
+  --bg: #0f1420;
+  --card: #161c2a;
+  --card-line: #2a3244;
+  --fg: #e8ecf4;
+  --muted: #8892a6;
+  --line: #2a3244;
+  --accent: #2f6bff;
+  --accent-fg: #ffffff;
+  --ok: #22c55e;
+  --warn: #d4a017;
+  --bad: #ef4444;
+  --field: #1b2233;
+}
+
+/* Light token set: the popup is dark by default (its whole visual identity),
+   but a user with `prefers-color-scheme: light` still gets a coherent,
+   readable set of tokens rather than the dark palette forced on them. */
+@media (prefers-color-scheme: light) {
+  :root {
+    color-scheme: light;
+    --bg: #f5f6f8;
+    --card: #ffffff;
+    --card-line: #dde1e8;
+    --fg: #1b2230;
+    --muted: #5b6474;
+    --line: #dde1e8;
+    --accent: #2f6bff;
+    --accent-fg: #ffffff;
+    --ok: #17954a;
+    --warn: #92650c;
+    --bad: #d92d2d;
+    --field: #f0f2f6;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html, body { background: var(--bg); }
+
+/* Fixed popup footprint: Chrome sizes an extension popup to its document, so
+ * a section that grows (more attached tabs, a longer approval list, a panel
+ * with more rows) used to resize the whole window -- switching tabs visibly
+ * jumped the popup around. Every direct child of body below is fixed height
+ * except .tab-panels, which is flex:1 with its own scrollbar -- see its own
+ * comment below. */
+body {
+  width: 400px;
+  height: 580px;
+  margin: 0;
+  padding: 12px;
+  background: var(--bg);
+  color: var(--fg);
+  font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* options.html reuses this stylesheet but is an ordinary scrolling tab page,
+ * not a fixed-size popup -- it needs every one of the popup-only constraints
+ * above undone, not just the width. */
+body.page {
+  width: auto;
+  height: auto;
+  max-width: 620px;
+  margin: 0 auto;
+  padding: 28px 20px;
+  overflow: visible;
+  display: block;
+}
+
+/* An author `display` rule beats the user-agent's `[hidden] { display: none }`
+   no matter the specificity, so `<div class="row" hidden>` rendered as a
+   normal flex row and the `hidden` property the popup was setting did nothing
+   at all. That is what kept Cancel on screen while connected: the JS was
+   already correct and had no way to win. Global and !important on purpose —
+   any future element given both `hidden` and a display-setting class inherits
+   the fix instead of rediscovering the bug. */
+[hidden] { display: none !important; }
+
+/* body is a flex column (see the body rule below); every direct child that
+ * isn't the one scrolling region (#pairedSection, or rather its own
+ * .tab-panels inside it) stays a fixed, non-growing row. */
+#cancelConnectRow,
+#pairSection {
+  flex: none;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+code, .mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* -- header ---------------------------------------------------------- */
+
+.app-header {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.app-icon {
+  flex: none;
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+}
+
+.app-identity {
+  flex: 1;
+  min-width: 0;
+}
+
+.app-title-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.app-title {
+  font-size: 14px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.app-device {
+  margin: 1px 0 0;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.app-header-actions {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.icon-button {
+  flex: none;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--card-line);
+  border-radius: 8px;
+  background: var(--card);
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.icon-button:hover { color: var(--fg); border-color: var(--muted); }
+
+/* Just a light, not a pill: no border, no background, no text -- the words
+ * live in its title/aria-label (set from popup.ts's statusChipState) so
+ * they're still available to a pointer hover or a screen reader, just not
+ * competing with the device name for header space. */
+.status {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--muted);
+  flex: none;
+}
+
+/* Footer dot: keyed off the raw connection state (no "paused turns it
+ * amber" rule there -- the footer is just "are we talking to the gateway at
+ * all"). */
+.dot.connected { background: var(--ok); }
+.dot.connecting, .dot.pairing { background: var(--warn); }
+.dot.error { background: var(--bad); }
+
+/* Header dot: keyed off dotColorClass() in popup.ts, which folds `paused`
+ * in (green only means connected AND actively sharing) -- a distinct class
+ * name rather than reusing .connected/.connecting above, since the two
+ * dots answer different questions from the same BridgeStatus. */
+.dot-ok { background: var(--ok); }
+.dot-warn { background: var(--warn); }
+.dot-bad { background: var(--bad); }
+
+label {
+  display: block;
+  margin: 10px 0 4px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.section-label { margin-top: 4px; }
+
+input[type="text"], input[type="url"], input[type="password"], input[type="number"] {
+  width: 100%;
+  padding: 7px 9px;
+  border: 1px solid var(--card-line);
+  border-radius: 6px;
+  background: var(--field);
+  color: var(--fg);
+  font: inherit;
+}
+
+input#pairCode {
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.35em;
+  text-align: center;
+  font-size: 18px;
+}
+
+.row { display: flex; gap: 8px; margin-top: 12px; }
+
+.row-compact {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-top: 8px;
+}
+.row-compact button { padding: 10px 8px; }
+
+button {
+  flex: 1;
+  padding: 9px 12px;
+  border: 1px solid var(--card-line);
+  border-radius: 8px;
+  background: var(--card);
+  color: var(--fg);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+button.primary, button.secondary.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-fg);
+}
+
+button.secondary {
+  background: transparent;
+  border: 1px solid var(--card-line);
+  color: var(--fg);
+}
+
+button.danger { color: var(--bad); }
+button.danger-outline {
+  background: transparent;
+  border: 1px solid var(--bad);
+  color: var(--bad);
+}
+button:disabled { opacity: 0.5; cursor: default; }
+
+.hint {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 11px;
+}
+
+code {
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: var(--field);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+}
+
+.error {
+  flex: none;
+  margin-top: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--bad);
+  border-radius: 6px;
+  color: var(--bad);
+  font-size: 12px;
+}
+
+.check { display: flex; align-items: center; gap: 8px; margin: 8px 0; }
+.check label { margin: 0; text-transform: none; font-size: 13px; color: var(--fg); font-weight: 400; }
+.saved { color: var(--ok); font-size: 12px; margin-left: 8px; }
+
+.tab-list {
+  list-style: none;
+  margin: 0 0 4px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.tab-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 11px 10px;
+  border: 1px solid var(--card-line);
+  border-radius: 10px;
+  background: var(--card);
+}
+
+.tab-info { flex: 1; min-width: 0; }
+
+.tab-title {
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mode-source {
+  font-size: 10px;
+  color: var(--muted);
+  opacity: 0.8;
+}
+
+.tab-origin {
+  flex: 1;
+  min-width: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Limited-mode share fix: another extension is blocking full chrome.debugger
+   control on this tab -- the tab is still shared, just driven without CDP. */
+.tab-mode-badge {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--warn);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mode-select, .tab-release {
+  flex: none;
+  padding: 4px 8px;
+  font-size: 11px;
+}
+
+.hint-inline {
+  margin: 0 0 12px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+/* -- action row -------------------------------------------------------- */
+
+.action-row {
+  flex: none;
+  display: flex;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.action-pause {
+  flex: 3;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  text-align: left;
+  padding: 11px 12px;
+  min-width: 0;
+}
+
+.action-pause.active {
+  background: var(--warn);
+  border-color: var(--warn);
+  color: #1b1400;
+}
+
+/* The label ellipsizes first -- it's the one side of this button that can
+ * lose characters without losing meaning. The shortcut chip never shrinks or
+ * wraps, so at no popup width (this button is tested down to 360px) can the
+ * two ever overlap. */
+#pauseButtonLabel {
+  font-weight: 700;
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.shortcut-hint {
+  flex: none;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 2px 6px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.16);
+  white-space: nowrap;
+}
+.shortcut-hint:empty { display: none; }
+
+.action-share {
+  flex: 2;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+}
+
+.action-share span {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.share-active-info { display: none; }
+
+/* -- attached tab cards -------------------------------------------------- */
+
+/* Capped at roughly 2 cards' worth of height, then its own scrollbar takes
+ * over -- one attached tab or ten, this list can never push the tab strip
+ * and footer down and change the popup's height. */
+.attached-cards {
+  list-style: none;
+  margin: 0 0 6px;
+  padding: 0 4px 0 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 122px;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+}
+
+.attached-card {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 9px;
+  border: 1px solid var(--card-line);
+  border-radius: 10px;
+  background: var(--card);
+}
+
+.attached-check {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--ok);
+  color: #ffffff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.attached-info { flex: 1; min-width: 0; }
+
+.attached-title-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.attached-title {
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.active-badge {
+  flex: none;
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: var(--accent);
+  color: var(--accent-fg);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.attached-origin {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mode-pill {
+  flex: none;
+  padding: 4px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--card-line);
+  background: var(--field);
+  color: var(--fg);
+  font-size: 10.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.mode-pill:hover { border-color: var(--accent); }
+
+.release-button {
+  flex: none;
+  padding: 4px 9px;
+  font-size: 10.5px;
+}
+
+/* -- share section ---------------------------------------------------- */
+
+.share-tabs-list {
+  gap: 8px;
+}
+
+.share-tab-info { min-width: 0; }
+
+.share-row-button {
+  flex: none;
+  padding: 4px 10px;
+  font-size: 11px;
+}
+
+.share-dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+.share-dot.blocked { background: var(--warn); }
+
+.tab-favicon {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 3px;
+}
+
+/* -- onboarding ---------------------------------------------------------- */
+
+.onboard-step-label {
+  margin: 0 0 8px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.onboard-step + .onboard-step {
+  margin-top: 4px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.code-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 0 10px;
+}
+
+.code-row code {
+  flex: 1;
+  padding: 6px 9px;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.code-row button {
+  flex: none;
+  padding: 5px 10px;
+  font-size: 11px;
+}
+
+.count-badge {
+  display: inline-block;
+  min-width: 15px;
+  padding: 0 4px;
+  margin-left: 4px;
+  border-radius: 8px;
+  background: var(--bad);
+  color: #ffffff;
+  font-size: 10px;
+  font-weight: 700;
+  text-align: center;
+  text-transform: none;
+  letter-spacing: normal;
+  vertical-align: middle;
+}
+.count-badge:empty { display: none; }
+
+.approval-list {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.approval-card {
+  padding: 10px;
+  border: 1px solid var(--warn);
+  border-radius: 8px;
+  background: var(--field);
+}
+
+.approval-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.approval-origin {
+  font-weight: 700;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.approval-ttl {
+  margin-left: auto;
+  flex: none;
+  font-size: 10px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.approval-ttl-low { color: var(--bad); font-weight: 700; }
+
+.approval-ask {
+  margin: 0 0 4px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.approval-summary {
+  margin: 0 0 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.approval-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.approval-actions button {
+  flex: 1;
+  padding: 6px 6px;
+  font-size: 11px;
+}
+
+.approval-once, .approval-session {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-fg);
+}
+
+.approval-always-row {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--line);
+}
+
+.approval-always {
+  width: 100%;
+  background: transparent;
+  border: 1px solid var(--warn);
+  color: var(--warn);
+  font-size: 10px;
+  font-weight: 600;
+  padding: 5px 6px;
+}
+
+.approval-always-note {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 10px;
+  text-align: center;
+}
+
+.gateway-config {
+  margin-top: 20px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.config-table {
+  width: 100%;
+  margin: 10px 0;
+  border-collapse: collapse;
+  font-size: 11px;
+}
+
+.config-table th, .config-table td {
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  text-align: left;
+  vertical-align: top;
+}
+
+.config-table th {
+  background: var(--field);
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+
+.config-table td:nth-child(1) { white-space: nowrap; }
+.config-table td:nth-child(2) { color: var(--muted); white-space: nowrap; }
+
+.share-tab-blocked {
+  color: var(--warn);
+  white-space: normal;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.replay-view {
+  margin-top: 12px;
+}
+
+.replay-frame {
+  width: 100%;
+  border-radius: 6px;
+  border: 1px solid var(--border, #333);
+  margin-top: 8px;
+}
+
+.replay-view input[type="range"] {
+  width: 100%;
+  margin-top: 8px;
+}
+
+/* pairedSection is the flex column that holds everything between the header
+ * and the footer: the action row, the attached-tab cards, the tab strip --
+ * all fixed height -- and .tab-panels, the one part of this popup that's
+ * allowed to grow, capped at flex:1 with its own scrollbar. pairSection
+ * (unpaired onboarding) doesn't need this -- its two steps are short and
+ * fixed, so it's left as ordinary flow inside the same fixed-height body. */
+#pairedSection {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+#pairedSection > *:not(.tab-panels) { flex: none; }
+
+/* -- tab strip ------------------------------------------------------- */
+
+.tab-strip {
+  flex: none;
+  display: flex;
+  gap: 2px;
+  margin-top: 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+/* The one scrolling region in the whole popup (see #pairedSection's comment
+ * above): flex:1 so it exactly fills whatever height the fixed rows above
+ * and below it leave, on every one of the three panels, so switching tabs
+ * never changes the popup's size. scrollbar-gutter reserves the thumb's own
+ * lane rather than overlaying it on the last card's right edge, and the
+ * thin/coloured scrollbar rules below (webkit + the Firefox fallback) keep
+ * that lane from feeling like dead space. */
+.tab-panels {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  scrollbar-color: var(--card-line) transparent;
+}
+
+.tab-panels::-webkit-scrollbar,
+.attached-cards::-webkit-scrollbar {
+  width: 8px;
+}
+.tab-panels::-webkit-scrollbar-track,
+.attached-cards::-webkit-scrollbar-track {
+  background: transparent;
+}
+.tab-panels::-webkit-scrollbar-thumb,
+.attached-cards::-webkit-scrollbar-thumb {
+  background: var(--card-line);
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+.tab-strip-btn {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  color: var(--muted);
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 8px 4px;
+  cursor: pointer;
+}
+
+.tab-strip-btn[aria-selected="true"] {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+
+.tab-panel {
+  padding-top: 12px;
+}
+
+.panel-header-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.panel-eyebrow {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.panel-hint-right {
+  font-size: 10px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.waiting-approval-box {
+  margin-top: 10px;
+  padding: 10px;
+  border: 1px dashed var(--card-line);
+  border-radius: 10px;
+}
+
+.waiting-approval-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.waiting-approval-empty {
+  margin: 0;
+  text-align: center;
+}
+.waiting-approval-empty strong {
+  color: var(--fg);
+  font-weight: 700;
+}
+
+/* -- footer ------------------------------------------------------------ */
+
+.app-footer {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 14px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+  font-size: 10.5px;
+  color: var(--muted);
+}
+
+.footer-conn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.footer-conn code {
+  background: none;
+  padding: 0;
+  color: var(--muted);
+  font-size: 10.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.footer-links {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+.footer-links a {
+  color: var(--muted);
+  text-decoration: none;
+}
+.footer-links a:hover { color: var(--fg); }

@@ -1,0 +1,13 @@
+name: browser-bridge
+version: "0.1.0"
+description: See and act in the user's real Chrome tabs via an MV3 extension and an in-gateway WebSocket relay.
+author: CAIU IT
+kind: standalone
+# requires_env is intentionally empty. Pairing secrets live in the plugin's own
+# state.db (~/.hermes/browser_bridge/state.db); configuration lives in
+# config.yaml under browser_bridge.* — repo rule: .env is secrets-only and no
+# new HERMES_* env vars.
+requires_env: []
+provides_tools:
+  - browser_bridge_status
+provides_hooks: []

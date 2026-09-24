@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Hermes Browser Bridge — Options</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body class="page">
+    <h1>Hermes Browser Bridge</h1>
+    <p class="sub">Connection and privacy settings for this device.</p>
+
+    <label for="gatewayUrl">Gateway WebSocket URL</label>
+    <input id="gatewayUrl" type="url" placeholder="ws://your-gateway-host:8765/bridge" />
+
+    <label for="deviceName">Device name</label>
+    <input id="deviceName" type="text" placeholder="my-laptop" />
+
+    <label>Connection</label>
+    <div class="check">
+      <input id="autoConnect" type="checkbox" />
+      <label for="autoConnect">Reconnect automatically when Chrome starts or wakes</label>
+    </div>
+
+    <section class="preloading">
+      <div class="check">
+        <input id="disableChromePreloading" type="checkbox" />
+        <label for="disableChromePreloading">Turn off Chrome's page preloading so other extensions can't block sharing</label>
+      </div>
+      <p class="hint">
+        Chrome sometimes loads a page in the background before you navigate to it (Settings &rarr;
+        Performance &rarr; Preload pages). If another extension &mdash; a password manager especially
+        &mdash; has injected a frame into that preloaded page, Chrome refuses to let this extension
+        attach to the tab at all, and the failure looks unrelated to preloading. This applies
+        immediately (not on Save, below) and changes a Chrome-wide setting, not just this extension's
+        own preference &mdash; every site may load slightly slower as a result. Off by default.
+      </p>
+      <p class="hint-inline" id="disableChromePreloadingStatus" hidden></p>
+    </section>
+
+    <section class="access">
+      <label for="defaultAccessMode">Default access for sites you haven't configured</label>
+      <p class="hint">
+        Every origin you've set a mode for in the popup keeps that exact mode &mdash; this only decides
+        what a site gets the first time Hermes attaches to it, before you've made a choice for it there.
+        Reported to the gateway (on connect, and immediately whenever you change it here) and stored per
+        device, so it's this extension's own setting, not only something an operator can set in the
+        gateway's <code>config.yaml</code>. Defaults to <strong>full</strong>: any tab you attach is
+        readable and drivable right away. Set it to <strong>request</strong> to get an approval prompt
+        the first time instead, or <strong>off</strong> to refuse an unconfigured site outright.
+      </p>
+      <select id="defaultAccessMode">
+        <option value="off">Off &mdash; refuse until you set a mode for this site in the popup</option>
+        <option value="request">Request &mdash; ask the first time, remember your answer</option>
+        <option value="full">Full &mdash; readable and drivable immediately (default)</option>
+      </select>
+    </section>
+
+    <section class="lease">
+      <label for="leaseSeconds">Tab lease (how long an agent session holds a tab between actions)</label>
+      <p class="hint">
+        Attaching a tab (or acting in one) takes a driving lease on it, so two agent sessions can
+        never interleave clicks on the same tab &mdash; every <code>act</code> call renews it. With
+        <strong>Unlimited</strong>, a tab stays with the session that attached it until that session
+        releases it, the user clicks Stop or Release all, or the tab is detached. Other agent
+        sessions are refused that tab meanwhile. Reported to the gateway (on connect, and immediately
+        whenever you change it here) and stored per device, same as Default access above. Defaults to
+        <strong>60 seconds</strong>, matching today's behaviour.
+      </p>
+      <input id="leaseSeconds" type="number" min="10" max="1200" step="1" placeholder="60" />
+      <div class="check">
+        <input id="unlimitedLease" type="checkbox" />
+        <label for="unlimitedLease">Unlimited &mdash; the lease never expires on its own</label>
+      </div>
+    </section>
+
+    <section class="commit">
+      <label for="commitMode">Committing actions</label>
+      <p class="hint">
+        A committing action is one that's hard to undo &mdash; submitting a form, or clicking
+        something named Finish, Submit, Send, Pay, Purchase, Buy, Place order, Delete, Remove,
+        Confirm, Publish, Transfer, Deploy or Power off. <strong>Auto proceed</strong> (default) keeps
+        today's behaviour: the action runs immediately and is only labelled in the audit log.
+        <strong>Pause for confirmation</strong> requires the agent to explicitly confirm the action
+        AND you to approve it in the popup first, whatever that site's own access mode already
+        allows. Reported to the gateway (on connect, and immediately whenever you change it here) and
+        enforced there, same as Default access and Tab lease above.
+      </p>
+      <select id="commitMode">
+        <option value="auto">Auto proceed (default)</option>
+        <option value="pause">Pause for confirmation</option>
+      </select>
+    </section>
+
+    <section class="redaction">
+      <label>Redaction</label>
+      <p class="hint">
+        Before any snapshot, page read or screenshot layout description leaves this machine, the
+        extension scans it for the kinds checked below and replaces each match with a marker like
+        <code>[redacted:card]</code>. The gateway re-checks on arrival as a second, independent pass
+        &mdash; but it honours this same policy: a kind you switch off here is off end to end, not
+        just on this side of the wire. It never quietly comes back at the gateway.
+      </p>
+      <p class="hint">
+        These five apply to every site the same way &mdash; this is one policy for this device, not a
+        per-site setting. To protect one site more than the rest, set that origin's mode in the popup.
+      </p>
+      <p class="hint">
+        Every change here &mdash; on or off, either direction &mdash; is written to the gateway's audit
+        log: which device, and the full policy before and after. Turning a protection off is a
+        deliberate, traceable choice, not a silent one. Nothing blocks the change; it is your
+        preference for your own machine.
+      </p>
+
+      <div class="check">
+        <input id="redactPasswords" type="checkbox" />
+        <label for="redactPasswords">Passwords &mdash; any field that looks like a password field, by type or name, regardless of its value</label>
+      </div>
+      <div class="check">
+        <input id="redactCreditCards" type="checkbox" />
+        <label for="redactCreditCards">Credit card numbers &mdash; digit runs that pass a card checksum (Luhn), so ordinary long numbers are left alone</label>
+      </div>
+      <div class="check">
+        <input id="redactSsn" type="checkbox" />
+        <label for="redactSsn">Social Security numbers &mdash; the standard 123-45-6789 shape</label>
+      </div>
+      <div class="check">
+        <input id="redactEmails" type="checkbox" />
+        <label for="redactEmails">Email addresses &mdash; off by default: ordinary pages mention addresses constantly, and catching them all means more of the page gets blanked out</label>
+      </div>
+      <div class="check">
+        <input id="redactPhones" type="checkbox" />
+        <label for="redactPhones">Phone numbers &mdash; off by default, same trade-off as email: North-American-style numbers only, and some ordinary digit runs can look like one</label>
+      </div>
+    </section>
+
+    <section class="powers">
+      <label>Powers</label>
+      <p class="hint">
+        What the agent is allowed to <em>do</em>, as opposed to Redaction above, which governs what
+        it's allowed to <em>see</em>. Unlike Redaction, every toggle below fails closed: leaving one
+        off &mdash; or never touching this page at all &mdash; refuses that capability, at the
+        extension, at the gateway, and at the approval prompt. Nothing here is granted by default
+        except the two already-safe ones (dismissing a dialog, reading the origin-scoped downloads
+        list).
+      </p>
+
+      <div class="check">
+        <input id="allowFileUpload" type="checkbox" />
+        <label for="allowFileUpload">Upload a local file &mdash; let the agent pick a file already on this machine to upload, limited to the paths listed under Upload roots below</label>
+      </div>
+      <div class="check">
+        <input id="allowFileUploadFromAgent" type="checkbox" />
+        <label for="allowFileUploadFromAgent">Upload agent-supplied bytes &mdash; let the agent hand over file contents directly (no local path involved), capped at Max upload size below</label>
+      </div>
+      <div class="check">
+        <input id="allowDialogDismiss" type="checkbox" />
+        <label for="allowDialogDismiss">Dismiss dialogs &mdash; let the agent close/cancel a JS alert, confirm, prompt or beforeunload dialog. Never accepts one, only ever the safe direction</label>
+      </div>
+      <div class="check">
+        <input id="allowDialogAccept" type="checkbox" />
+        <label for="allowDialogAccept">Accept dialogs &mdash; let the agent confirm/accept a JS dialog instead of only dismissing it. Off by default: this is the direction that can submit something</label>
+      </div>
+      <div class="check">
+        <input id="allowEvaluate" type="checkbox" />
+        <label for="allowEvaluate">Run JavaScript &mdash; let the agent evaluate an arbitrary expression in the page. The single most powerful toggle on this page &mdash; every call is audited verbatim</label>
+      </div>
+      <div class="check">
+        <input id="allowConsoleRead" type="checkbox" />
+        <label for="allowConsoleRead">Read console output &mdash; let the agent read this tab's console log/warn/error entries, redacted the same as any other page text</label>
+      </div>
+      <div class="check">
+        <input id="allowCookieWrite" type="checkbox" />
+        <label for="allowCookieWrite">Write cookies &mdash; let the agent set or overwrite a cookie, limited to origins it's attached to</label>
+      </div>
+      <div class="check">
+        <input id="allowHttpAuth" type="checkbox" />
+        <label for="allowHttpAuth">Read HTTP auth status &mdash; let the agent see whether a tab is showing an HTTP auth challenge. Read-only: actually arming credentials stays a user-only action</label>
+      </div>
+      <div class="check">
+        <input id="allowDownloadsRead" type="checkbox" />
+        <label for="allowDownloadsRead">Read downloads &mdash; let the agent see this tab origin's own downloads, never the browser's full download history</label>
+      </div>
+
+      <label for="uploadRoots">Upload roots (one path per line)</label>
+      <textarea id="uploadRoots" rows="3" placeholder="/Users/you/Downloads"></textarea>
+      <p class="hint-inline">
+        Empty means deny every local-path upload, even with Upload a local file switched on above
+        &mdash; enabling that checkbox alone grants nothing.
+      </p>
+
+      <label for="maxUploadBytes">Max upload size (bytes)</label>
+      <input id="maxUploadBytes" type="number" min="0" step="1" placeholder="10485760" />
+    </section>
+
+    <div class="row">
+      <button id="save" class="primary">Save</button>
+      <span class="saved" id="saved" hidden>Saved</span>
+    </div>
+
+    <section class="gateway-config">
+      <label>Gateway configuration</label>
+      <p class="hint-inline">
+        These live on the gateway host, in Hermes' own <code>config.yaml</code> under
+        <code>browser_bridge:</code> &mdash; not here. This extension cannot read or write them; the
+        list below is a reference so you know what exists and where to change it. Edit
+        <code>config.yaml</code>, then restart the gateway:
+        <code>systemctl --user restart hermes-gateway</code>.
+      </p>
+      <table class="config-table">
+        <thead>
+          <tr>
+            <th scope="col">Key</th>
+            <th scope="col">Default</th>
+            <th scope="col">What it does</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td><code>enabled</code></td><td>true</td><td>Whether the browser-bridge plugin is active at all.</td></tr>
+          <tr><td><code>host</code></td><td>0.0.0.0</td><td>Network interface the relay WebSocket server binds to.</td></tr>
+          <tr><td><code>port</code></td><td>8765</td><td>Port the relay WebSocket server listens on.</td></tr>
+          <tr><td><code>path</code></td><td>/bridge</td><td>URL path component of the WebSocket endpoint.</td></tr>
+          <tr><td><code>pair_code_ttl_minutes</code></td><td>10</td><td>Minutes a printed pairing code stays usable (single use).</td></tr>
+          <tr><td><code>device_offline_after_seconds</code></td><td>90</td><td>Seconds without a heartbeat before a device is considered offline.</td></tr>
+          <tr><td><code>default_mode</code></td><td>full</td><td>Fleet-wide floor for the access mode applied to an origin nobody has configured. As of this extension's own "Default access for sites you haven't configured" setting above, this <em>config.yaml</em> value is only what a device falls back to if it has never reported its own default &mdash; a device that has (the normal case, since the extension setting defaults to full on install) is governed by what it reported instead. Still useful as the fleet floor for a brand-new device, or one that has never opened this Options page.</td></tr>
+          <tr><td><code>lease_seconds</code></td><td>60</td><td>Fleet-wide floor for how long a tab's driving lease lasts before another Hermes session may attach it. Same relationship to this extension's own "Tab lease" setting above as <code>default_mode</code> has to "Default access": only what a device falls back to if it has never reported its own value (or reported unlimited); a device that has is governed by what it reported instead.</td></tr>
+          <tr><td><code>vision</code></td><td>auto</td><td>Vision handling for screenshots &mdash; auto probes the model's vision capability; force_* skips the probe.</td></tr>
+          <tr><td><code>vision_model</code></td><td><em>(unset)</em></td><td>Optional dedicated model for the vision delegation path, if different from the main model.</td></tr>
+          <tr><td><code>vision_probe_ttl_hours</code></td><td>24</td><td>Hours a probed model's vision capability is trusted before re-probing.</td></tr>
+          <tr><td><code>vision_probe_max_tokens</code></td><td>512</td><td>Max tokens allowed for the one-time vision capability probe call.</td></tr>
+          <tr><td><code>vision_probe_timeout_s</code></td><td>20</td><td>Timeout, in seconds, for the vision capability probe call.</td></tr>
+          <tr><td><code>vision_screenshot_dir</code></td><td><em>(unset &rarr; under ~/.hermes/browser_bridge)</em></td><td>Directory saved screenshots are stored under.</td></tr>
+          <tr><td><code>vision_screenshot_retention_hours</code></td><td>24</td><td>Hours a saved screenshot is kept before being purged.</td></tr>
+          <tr><td><code>vision_screenshot_max_bytes</code></td><td>200 MB</td><td>Total retained screenshot bytes before older ones are purged.</td></tr>
+          <tr><td><code>vision_ocr_enabled</code></td><td>true</td><td>Set false to force-disable OCR even if pytesseract/tesseract are installed.</td></tr>
+          <tr><td><code>audit_max_bytes</code></td><td>25 MB</td><td>Audit log (<code>audit.jsonl</code>) rotation size threshold.</td></tr>
+          <tr><td><code>audit_keep</code></td><td>5</td><td>Number of rotated audit log files kept.</td></tr>
+          <tr><td><code>approval_ttl_seconds</code></td><td>120</td><td>How long a pending "request"-mode approval blocks the gateway before defaulting to deny.</td></tr>
+          <tr><td><code>approval_delivery_timeout_seconds</code></td><td>10</td><td>How long to wait for this extension to acknowledge an approval request before treating it as unreachable (denied).</td></tr>
+          <tr><td><code>approval_session_grant_ttl_hours</code></td><td>12</td><td>How long a "this session" approval keeps auto-approving the same device+origin+capability.</td></tr>
+        </tbody>
+      </table>
+      <p class="hint-inline">
+        Generated from <code>hermes_plugin/config.py</code>'s <code>DEFAULTS</code> &mdash; see
+        <code>docs/pairing.md</code> for the full setup walkthrough.
+      </p>
+    </section>
+
+    <section class="presence">
+      <label>Presence</label>
+      <p class="hint">
+        What you see in the browser itself while Hermes is attached to a tab and working in it &mdash;
+        separate from the pairing/connection status above. All three default on: the whole point of
+        this extension is that an agent is driving a browser you're sitting in front of, and an agent
+        you can't see moving is the failure mode to design against. See <code>docs/presence.md</code>
+        for exactly what each one looks like and its honest limits.
+      </p>
+
+      <div class="check">
+        <input id="showPresenceCursor" type="checkbox" />
+        <label for="showPresenceCursor">Pointer &mdash; a purple arrow that glides to each click/type/key/scroll target before Hermes acts, with a ripple on every real click. It stays at its last point (dimmed when idle) while the tab is shared. Clicks wait for it to arrive, so they take up to about a second longer.</label>
+      </div>
+      <div class="field">
+        <label for="pointerAnimation">Pointer animation</label>
+        <select id="pointerAnimation">
+          <option value="normal">Normal &mdash; today's glide (about 450&ndash;900ms to reach the target)</option>
+          <option value="fast">Fast &mdash; a quick glide capped at about 150ms; ripple and label stay</option>
+          <option value="off">Off &mdash; the pointer jumps straight to the target; ripple and label stay</option>
+        </select>
+        <p class="hint-inline">
+          How long a click/type/key/scroll waits for the pointer to arrive before Hermes acts. Normal and Fast
+          both show the travel; Off skips it and jumps instead, which is the quickest but least visible option.
+          Whichever you pick, Hermes automatically uses Fast instead of Normal whenever the shared tab isn't the
+          active tab of a focused window &mdash; nobody is watching it, so there's nothing to gain from the slower
+          glide. Off stays Off either way. This never switches tabs or windows on your behalf.
+        </p>
+      </div>
+      <div class="check">
+        <input id="showActivityGlow" type="checkbox" />
+        <label for="showActivityGlow">"Being viewed" glow &mdash; a soft purple glow on the inside edges of the tab, pulsing slowly whenever Hermes is looking at or acting on the page (snapshot, read, screenshot, ask, act) and for a few seconds after, plus a corner label naming what it's doing ("viewing", "reading", "looking", "clicking", ...). An extension can't paint on Chrome's own window border, so this is around the page, not around the window. Screenshots Hermes takes never include it.</label>
+      </div>
+      <div class="check">
+        <input id="highlightSharedTabs" type="checkbox" />
+        <label for="highlightSharedTabs">Group shared tabs &mdash; collects every tab Hermes is attached to into a coloured "Shared with Hermes" tab group, moving tabs in your tab strip. Off leaves tabs exactly where you put them; the popup's list stays the only indicator.</label>
+      </div>
+      <div class="check">
+        <input id="holdForeignFramesWhileAttached" type="checkbox" />
+        <label for="holdForeignFramesWhileAttached">While attached, hold other extensions' in-page frames &mdash; some extensions (password managers especially) inject their own frame into a page, and Chrome refuses to keep this extension's debugger attached while one is present. With this on, Hermes temporarily removes such a frame the moment it appears on a tab it's attached to, and puts it back the instant that tab is released. The tradeoff: that other extension's own in-page popup (e.g. a password manager's autofill dropdown) will not appear on a shared tab until you release it. Off trades that back for a session more likely to be dropped without warning.</label>
+      </div>
+    </section>
+
+    <section class="replay">
+      <label>Replay</label>
+      <p class="hint">
+        A local recording of what the agent did — one small, scaled-down frame plus a short caption
+        per action (click "Submit", type into "email", ...), kept only on this device in the
+        extension's own storage and never sent to the gateway. Off by default. See
+        <code>docs/security.md</code> for exactly what is (and isn't) stored.
+      </p>
+      <div class="check">
+        <input id="recordReplay" type="checkbox" />
+        <label for="recordReplay">Record agent activity for replay</label>
+      </div>
+      <div class="field">
+        <label for="replayRetention">Keep the last</label>
+        <input id="replayRetention" type="number" min="1" max="1000" step="1" placeholder="200" /> actions
+        (also capped at 50&nbsp;MB total; oldest recordings are dropped first either way).
+      </div>
+    </section>
+
+    <script type="module" src="options.js"></script>
+  </body>
+</html>
