@@ -1,12 +1,26 @@
 # Hermes Browser Bridge
 
-A Chrome extension and a Hermes gateway plugin. Together they let a Hermes agent work in tabs you share from your own Chrome, using the logins you already have.
+# What it is
+
+A Chrome extension and a Hermes gateway plugin. Together, they let a Hermes agent work in tabs you share from your own Chrome session right along side of you.
 
 ## Why it exists
 
-A lot of internal tooling only works in a signed-in browser: ticketing systems, hypervisor consoles, backup and network dashboards, admin panels. They sit behind SSO or MFA and often have no usable API. A headless browser has to sign in again and usually can't. This bridge gives the agent your existing session instead, limited to the tabs you share and the rules you set.
+Hermes has its own browser, but sometimes it's necessary for a human to drive.
 
-## The popup
+This gives Hermes eyes and hands into your local browser to see and (if you choose) manipulate whatever you can see and touch in your browser. This is super useful if whatever app you're working in has no usable API or is only authenticated through JWT. Tons of reasons why you would want Hermes to work alongside you, or even unattended on your local browser if you really want.
+
+Three quick notes:
+
+* I recommend using a model with image capabilities with this Plugin. It helps to give Hermes eyes instead of just hands.
+* Model speed greatly affects how quickly your task can be completed. A pair of DGX Sparks running Qwen 3.8 Flash Next was able to perform a full Ubuntu OS install from VMWare's web console in about 15 minutes on its first run.
+* Successive runs should complete more quickly than the first. This plugin is self-learning and self-correlating using the Skills Link function (see below for more on this).
+
+## Chrome extension
+
+The meat of this entire project is the Chrome extension. It's what you will be interacting with most, and what allows your agent to be portable onto any desktop OS browser (as long as you have network reachability back to your Hermes instance through the local network or something like Tailscale).
+
+Install the extension, point it at your Hermes install, and configure the Powers that you are giving your agent.
 
 <p>
   <img src="docs/images/popup-tabs.png" width="300" alt="Popup with one shared tab and two tabs available to share">
@@ -14,9 +28,15 @@ A lot of internal tooling only works in a signed-in browser: ticketing systems, 
   <img src="docs/images/popup-host.png" width="300" alt="Host and network tab">
 </p>
 
-Tab titles and addresses are redacted. The status light is green when live, yellow when paused or reconnecting, and red when disconnected. The Tabs, Credentials and Host / Net tabs hold everything else.
+(Tab titles and addresses are redacted here)
 
-## What it does
+## What are Powers?
+
+Good question! Think of them as gates for tool calls. They are abilities that you provide or take away from your agent so it can perform actions like upload files, accept/dismiss message boxes, run Javascript, interact with dev console, read/write cookies, etc.
+
+The more Powers you give your agent, the more it can do... which coincidentally makes it potentially more dangerous to run unattended.
+
+## What it can do
 
 **Sharing and control**
 - The agent sees nothing until you share a tab. Pause, release, or press Alt+Shift+S to stop.
@@ -50,21 +70,33 @@ Tab titles and addresses are redacted. The status light is green when live, yell
 - Named sessions can be resumed later with their approvals.
 - Tabs get short names and roles in a session. The agent can close tabs it opened, never yours.
 
+## Skills Link
+
+Browser Bridge uses a custom `Skills Link` to correlate known skills with whatever you're accessing in your local browser.
+
+That means if your Hermes agent already understands how to use something like VMWare vCenter, it can correlate the known skill with the website that it is visiting. Likewise, the app helps Hermes learn that it can use Browser Bridge (when a session is active) as part of its Skills Library for VMWare vCenter in the future.
+
+*An example of this*:
+
+I had Hermes use Browser Bridge to access VMWare ESXI and stand up a new Ubuntu virtual machine. It learned how to interact with VMWare's web console, browse and search datastores, and how to adapt to the console's latency affecting keystroke drops. It also learned how to handle the Ubuntu OS install directly from a visual console using OCR to turn a snapshot of the console image into actionable form fields that it could use keyboard controls to manipulate.
+
 ## Safety controls
 
 - The gateway and the extension both enforce each site's access mode.
-- Evaluate, upload, console, downloads, cookie writes and HTTP sign-in each need a setting turned on in Options, plus an approval.
+- Evaluate, upload, console, downloads, cookie writes and HTTP sign-in each need a setting turned on in Options, plus an approval (if you have approvals turned on).
 - Each iframe is checked against its own origin.
-- Passwords, card numbers and national ID numbers are redacted before they leave the page. Email and phone redaction are optional. Console output is scrubbed of tokens and keys.
-- Page text is marked as untrusted in every result, and text that tries to instruct the agent is flagged.
+- PII can be redacted before it's shipped to your agent. Passwords, card numbers, ID numbers, email addresses, phone numbers, and more can be redacted before they leave the page. Console output can also be scrubbed of tokens and keys.
+- Page text is marked as untrusted in every result, and text that tries to instruct the agent is flagged to help minimize successful attempts at prompt injection.
 - Optional pause before committing clicks such as Submit, Send, Pay or Delete. The default is Auto proceed.
-- Optional replay: one small frame and a caption per action, never typed text. Export it from the popup.
+- Optional replay: one small frame and a caption per action (no typed text). Session data can be exported and then replayed later.
 - Every tool call is logged with its session. `hermes browser-bridge revoke <device>` cuts a device off immediately.
 - Devices pair with a one-time code, and tokens are stored hashed.
 
 ## Password managers
 
-Chrome blocks the debugger on any tab that contains another extension's frame, and password managers add those frames to login pages. The bridge removes them while it attaches and puts them back, holds new ones while the tab is shared, and if Chrome still refuses, shares the tab in limited mode (actions run through the page) until full access is possible again. You don't need to turn the password manager off.
+Chrome blocks the debugger on any tab that contains another extension's frame, and password managers add those frames to login pages.
+
+The bridge removes password managers them while it attaches and puts them back, or holds new ones while the tab is shared. If Chrome still refuses to attach the Bridge, it shares the tab in limited mode (actions run through the page) until full access is possible again. You don't need to turn the password manager off.
 
 ## How it works
 
