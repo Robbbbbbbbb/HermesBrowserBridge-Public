@@ -29,7 +29,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from . import approvals, audit, cli, config, relay, state, tools
+from . import approvals, audit, cli, config, relay, skill_hooks, state, tools
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +101,14 @@ def register(ctx) -> None:
             )
         except Exception:
             logger.exception("browser_bridge: skill registration failed")
+
+    try:
+        # Skill Links (ProjectRules/skilllinks.md SL3): annotates skill_view
+        # results with what the bridge knows about a product skill's
+        # counterpart reference, and invalidates that index on skill writes.
+        skill_hooks.register(ctx)
+    except Exception:
+        logger.exception("browser_bridge: skill-link hooks registration failed")
 
     started = False
     relay_error = ""

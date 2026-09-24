@@ -57,6 +57,48 @@ you didn't scroll — then act again with what you learned. A second identical
 `act` call almost never succeeds where the first one silently didn't; a
 one-call diagnosis usually shows why.
 
+## 0b. Skills and products
+
+An `attach`, `open_tab`, `snapshot`, or `act` result can carry a `skills`
+block for the tab's origin -- a list of up to 3 when `attach` leased several
+distinct origins at once, otherwise a single object: matching product
+skills, matching references under this skill, and a `load` list of exact
+calls to run, e.g. `skill_view('vmware-esxi')`,
+`skill_view('browser-bridge', file_path='references/esxi-ui.md')`. Viewing a
+product skill can carry a `browser_bridge` key back: whether a reference
+covers it, whether the two are linked, and a fix when they aren't. Don't
+skip either block just because the task looks doable without it.
+
+**Load the product skill and the bridge reference before acting on a
+product.** The product skill's API/CLI knowledge (endpoints, object model,
+workflows) holds through the browser too; the reference holds what only
+shows up when you drive that product's UI by hand. Skipping either means
+re-learning something Hermes already knows.
+
+**Where a new lesson goes:**
+- Browser-specific behaviour (a selector quirk, a wizard's scroll container,
+  a dispatch/timing issue) → `references/<product>.md` under this skill,
+  headed `products: [vmware-esxi]` / `aliases: [esxi]` / `skills:
+  [vmware-esxi]`.
+- API/CLI/domain knowledge (an endpoint, a field name, an auth header) → the
+  product skill itself, never a reference here.
+- Bridge mechanics true on every site (targeting, modes, pagination) → this
+  file.
+
+**Link both ways.** A reference's `skills:` header names the product
+skill(s) that know this product outside the browser; that skill carries
+`related_skills: [browser-bridge]` plus one line under `## Via Browser
+Bridge`, e.g. `See browser-bridge's references/vmware-esxi.md for driving
+the UI directly.` Notice a one-sided link and add the missing side.
+
+**Save only what actually worked, and never blame the site for a bridge
+bug.** Before writing "this product only accepts X," rule out that the bridge
+mishandled the input. A guest console that seems to reject Shift and
+symbols is a real example: that's the bridge's own key dispatch dropping
+them, not a console property — "lowercase-only credentials" as a site
+lesson would enshrine the bug. Report a suspected bridge defect instead of
+writing the workaround down as a lesson.
+
 ## 1. Choose the right tool
 
 | You want to... | Use |

@@ -81,6 +81,7 @@ from . import attach as attach_mod
 from . import audit, config, protocol
 from . import refusals
 from . import relay as relay_mod
+from . import skills_hint
 from . import state
 from . import timing as timing_mod
 
@@ -5423,6 +5424,12 @@ def _wrap_handler_with_timing(name: str, handler: Callable[..., str]) -> Callabl
                         patterns=sorted({h["pattern"] for h in hits}),
                         fields=[h["field"] for h in hits],
                     )
+            # skilllinks.md SL2: the `skills` hint block goes on AFTER the
+            # suspicious-text scan above, never before -- a product skill's
+            # own description can legitimately contain a tool name or phrase
+            # that scan reacts to, and this plugin-authored block must never
+            # be what trips it. skills_hint.apply is unconditionally fail-open.
+            skills_hint.apply(name, data, kwargs)
             raw = json.dumps(data)
         # Numbers only (tool name, device id if this handler's own audit
         # calls already recorded one under a different event -- this one

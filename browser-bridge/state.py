@@ -307,6 +307,33 @@ CREATE TABLE IF NOT EXISTS agent_opened_tabs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_agent_opened_tabs_device ON agent_opened_tabs(device_id);
+
+-- Skill Links SL1.6 (skilllinks.md): a bounded log of (origin, skill)
+-- pairs actually seen together in a bridged task -- the "used" match signal
+-- hermes_plugin/skill_links.py's match_page/match_skill treat as trusted,
+-- alongside a reference/skill's own declared products/origins header.
+-- `file_path` is empty for a SKILL.md view (the observation covers the
+-- whole product skill) and the reference's own relative path
+-- (`references/esxi-ui.md`) for a browser-bridge reference view -- see
+-- skill_hooks.py's SL3.2/SL3.3 (the only writer, via
+-- skill_links.record_used()). `source` is `'used'` for a binding
+-- corroborated by anything other than the page's own title (trusted; counted
+-- by match_page's "used" precedence step) or `'used_title'` for one
+-- corroborated ONLY by the page's title (still page-authored, so surfaced in
+-- observed_origins/products_index but never trusted on its own -- see
+-- skill_links.record_used()'s docstring). New table only, per this module's
+-- migration policy
+-- (`CREATE TABLE IF NOT EXISTS`, no `ALTER TABLE`, no `user_version`).
+CREATE TABLE IF NOT EXISTS skill_link_observations (
+    origin     TEXT NOT NULL,
+    skill      TEXT NOT NULL,
+    file_path  TEXT NOT NULL DEFAULT '',
+    source     TEXT NOT NULL DEFAULT 'used',
+    first_seen INTEGER NOT NULL,
+    last_seen  INTEGER NOT NULL,
+    count      INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (origin, skill, file_path)
+);
 """
 
 # Mirrors protocol/schema.json's `definitions.redactionKind` enum and
@@ -1670,3 +1697,63 @@ def forget_agent_opened_tabs_for_device_tab(device_id: str, tab_id: int) -> int:
         )
         conn.commit()
     return cur.rowcount
+
+
+# --- skill link observations (skilllinks.md SL1.6) --------------------------
+#
+# The only table hermes_plugin/skill_links.py writes -- everything else it
+# does is a read-only scan of the skill library. Bounded so a long-lived
+# gateway never grows this table without limit: a genuinely new row that
+# would push the table over the cap evicts the stalest (oldest `last_seen`)
+# row(s) first.
+
+SKILL_LINK_OBSERVATIONS_CAP = 500
+
+
+def record_skill_link_observation(origin: str, skill: str, file_path: str = "", source: str = "used") -> None:
+    """Upsert one (origin, skill, file_path) observation: a fresh row starts
+    at count 1, a repeat bumps `last_seen` and `count` in place. No-ops on an
+    empty origin/skill -- there is nothing useful to key an observation on."""
+    if not origin or not skill:
+        return
+    now = _now()
+    with _lock:
+        conn = connect()
+        conn.execute(
+            "INSERT INTO skill_link_observations (origin, skill, file_path, source, first_seen, last_seen, count)"
+            " VALUES (?, ?, ?, ?, ?, ?, 1)"
+            " ON CONFLICT(origin, skill, file_path)"
+            " DO UPDATE SET last_seen = excluded.last_seen, source = excluded.source, count = count + 1",
+            (origin, skill, file_path, source, now, now),
+        )
+        conn.commit()
+        row_count = conn.execute("SELECT COUNT(*) AS n FROM skill_link_observations").fetchone()["n"]
+        if row_count > SKILL_LINK_OBSERVATIONS_CAP:
+            conn.execute(
+                "DELETE FROM skill_link_observations WHERE rowid IN ("
+                " SELECT rowid FROM skill_link_observations ORDER BY last_seen ASC LIMIT ?)",
+                (row_count - SKILL_LINK_OBSERVATIONS_CAP,),
+            )
+            conn.commit()
+
+
+def list_skill_link_observations(skill: str = "", origin: str = "") -> List[Dict[str, Any]]:
+    """Observed bindings, optionally filtered by skill and/or origin, newest
+    first. Both filters are exact-match and cheap: the table is capped at
+    `SKILL_LINK_OBSERVATIONS_CAP` rows, so no index beyond the primary key
+    is worth the added migration surface."""
+    query = "SELECT origin, skill, file_path, source, first_seen, last_seen, count FROM skill_link_observations"
+    clauses = []
+    params: List[Any] = []
+    if skill:
+        clauses.append("skill = ?")
+        params.append(skill)
+    if origin:
+        clauses.append("origin = ?")
+        params.append(origin)
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+    query += " ORDER BY last_seen DESC"
+    with _lock:
+        rows = connect().execute(query, params).fetchall()
+    return [dict(row) for row in rows]

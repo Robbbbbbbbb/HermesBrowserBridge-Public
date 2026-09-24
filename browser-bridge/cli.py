@@ -1,4 +1,4 @@
-"""``hermes browser-bridge`` CLI: pair, devices, revoke, logs, status, export.
+"""``hermes browser-bridge`` CLI: pair, devices, revoke, logs, status, export, skills.
 
 Registered through ``ctx.register_cli_command``; ``setup_cli`` receives the
 argparse subparser for ``browser-bridge`` and adds its own sub-subcommands.
@@ -34,12 +34,12 @@ from pathlib import Path
 from typing import Optional
 
 from . import attach as attach_mod
-from . import audit, config, relay as relay_mod, state
+from . import audit, config, relay as relay_mod, skill_links, state
 
 
 def setup_cli(parser: argparse.ArgumentParser) -> None:
     sub = parser.add_subparsers(
-        dest="browser_command", metavar="{pair,devices,revoke,logs,status,export}"
+        dest="browser_command", metavar="{pair,devices,revoke,logs,status,export,skills}"
     )
 
     pair = sub.add_parser("pair", help="print a one-time pairing code for the Chrome extension")
@@ -94,6 +94,12 @@ def setup_cli(parser: argparse.ArgumentParser) -> None:
         help="overwrite --out if it already exists and is non-empty",
     )
 
+    skills = sub.add_parser(
+        "skills",
+        help="show how bridge references and product skills are linked (read-only)",
+    )
+    skills.add_argument("--json", action="store_true", help="print products_index() as-is, for scripts")
+
 
 def handle_cli(args: argparse.Namespace) -> int:
     command = getattr(args, "browser_command", None)
@@ -104,10 +110,11 @@ def handle_cli(args: argparse.Namespace) -> int:
         "logs": _cmd_logs,
         "status": _cmd_status,
         "export": _cmd_export,
+        "skills": _cmd_skills,
     }
     handler = handlers.get(command or "")
     if handler is None:
-        print("usage: hermes browser-bridge {pair,devices,revoke,logs,status,export}")
+        print("usage: hermes browser-bridge {pair,devices,revoke,logs,status,export,skills}")
         return 1
     return handler(args)
 
@@ -354,6 +361,96 @@ def _cmd_status(_args: argparse.Namespace) -> int:
     else:
         print(f"Relay          : {json.dumps(relay.status())}")
     return _cmd_devices(argparse.Namespace(all=False, json=False))
+
+
+def _skills_root() -> Path:
+    """Where `skill_links` looked for the local skill library — used only to
+    give the empty-index message somewhere concrete to point at. Reaches into
+    `skill_links`'s own HERMES_HOME resolution rather than duplicating it, so
+    the two never drift apart."""
+    return skill_links._hermes_home() / "skills"
+
+
+def _protected_label(protected: "Optional[bool]") -> str:
+    if protected is True:
+        return "protected: yes"
+    if protected is False:
+        return "protected: no"
+    return "protected: unknown"
+
+
+def _skill_label(skill: dict, has_refs: bool = True) -> str:
+    """One product skill entry (products_index()'s `product_skills` shape)
+    rendered as ``name (linked, reference lists it, protected: yes)``.
+    ``ref_names_skill`` is a newer, optional field (whether the bridge
+    reference's own `skills:` header names this skill) — shown only when the
+    row actually carries it, via `.get`, so this keeps working unchanged
+    against an index built before that field existed."""
+    parts = ["linked" if skill.get("linked") else "not linked"]
+    ref_names_skill = skill.get("ref_names_skill")
+    if ref_names_skill is not None and has_refs:
+        parts.append("reference lists it" if ref_names_skill else "reference doesn't list it")
+    parts.append(_protected_label(skill.get("protected")))
+    return f"{skill['name']} ({', '.join(parts)})"
+
+
+def _cmd_skills(args: argparse.Namespace) -> int:
+    rows = skill_links.products_index()
+    if getattr(args, "json", False):
+        print(json.dumps(rows, indent=2))
+        return 0
+
+    if not rows:
+        print(f"No bridge references or product skills found under {_skills_root()}.")
+        return 0
+
+    total_missing = 0
+    needs_adopt: "list[str]" = []
+    for i, row in enumerate(rows):
+        if i:
+            print()
+        products = row.get("products") or row.get("terms")
+        if products:
+            print(", ".join(products))
+        elif row.get("bridge_references"):
+            print(f"(unnamed — see {row['bridge_references'][0]['file']})")
+        else:
+            print("(unnamed)")
+
+        refs = row.get("bridge_references") or []
+        if refs:
+            ref_text = ", ".join(f"{r['file']} — {r['heading']}" if r.get("heading") else r["file"] for r in refs)
+        else:
+            ref_text = "(none)"
+        print(f"  {'references:':<13}{ref_text}")
+
+        product_skills = row.get("product_skills") or []
+        if product_skills:
+            skills_text = ", ".join(_skill_label(s, bool(refs)) for s in product_skills)
+        else:
+            skills_text = "(none)"
+        print(f"  {'skills:':<13}{skills_text}")
+        for s in product_skills:
+            if not s.get("linked") and s.get("protected") is not False:
+                needs_adopt.append(s["name"])
+
+        origins = row.get("origins") or []
+        print(f"  {'origins:':<13}{', '.join(origins) if origins else '(none)'}")
+
+        missing_links = row.get("missing_links") or []
+        print(f"  {'missing:':<13}{'; '.join(missing_links) if missing_links else '(none)'}")
+        total_missing += len(missing_links)
+
+    print()
+    print(f"{len(rows)} product{'s' if len(rows) != 1 else ''}, "
+          f"{total_missing} missing link{'s' if total_missing != 1 else ''}")
+    if needs_adopt:
+        names = ", ".join(sorted(set(needs_adopt)))
+        print(
+            f"Protected or unknown-writability skills can't be auto-linked — run "
+            f"`hermes curator adopt <name>` first (affects: {names})."
+        )
+    return 0
 
 
 def _percentile(sorted_values: "list[float]", fraction: float) -> float:
