@@ -24,6 +24,7 @@ raising, so a bug here can never break the tool call it was meant to enrich.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import threading
@@ -55,6 +56,21 @@ BASE_STOPWORDS: frozenset = frozenset((
 # identify a specific product (§2) and is folded into the dynamic stopword
 # set computed at index-build time, alongside BASE_STOPWORDS above.
 _COMMON_TERM_SKILL_THRESHOLD = 3
+
+# How many independent uses of an unheadered origin earn it a promotion
+# suggestion: "write this origin into the target's own header" (rev2's
+# promotion_candidates). Independent means once per (holder, origin, skill,
+# file_path) per gateway process -- skill_hooks.py enforces that count, this
+# module just reads it back.
+PROMOTE_AFTER_USES = 3
+
+# Cap on how many promotion candidates a single products_index() row carries.
+_PROMOTE_ROW_CAP = 3
+
+# The bundled manual's own top heading -- used only to detect (never to fix)
+# a deploy mistake where that file was copied over Hermes's own LEARNED
+# browser-bridge skill (see bundled_manual_misplacement()).
+BUNDLED_MANUAL_H1 = "# Using the Browser Bridge"
 
 # How often the mtime/size stat walk that decides whether to rebuild may run
 # (skilllinks.md's "Keep it cheap" rule). A call inside this window reuses
@@ -247,28 +263,56 @@ def _provenance_module():
         return None
 
 
-def _compute_protected(provenance, name: str, external: bool) -> Optional[bool]:
-    """Best-effort writability (skilllinks.md SL1.4): protected (not safely
-    auto-patchable) when the skill is bundled, hub-installed, lives in an
-    external skills dir, is pinned, or has never been adopted into curator
-    management (`created_by: agent` -- SL3.3 only offers to edit a skill's
-    frontmatter once it has been). ``None`` -- never ``False`` -- when the
-    provenance module isn't importable or anything about the check raises:
-    an unknown answer must never be read as "safe to write"."""
+def _compute_protected(provenance, name: str, external: bool) -> Tuple[Optional[bool], Optional[str]]:
+    """Best-effort writability, plus WHY (skilllinks.md SL1.4, rev2's
+    `protected_reason`): protected (not safely auto-patchable) when the
+    skill is bundled, hub-installed, lives in an external skills dir, is
+    pinned, or has never been adopted into curator management (`created_by:
+    agent` -- SL3.3 only offers to edit a skill's frontmatter once it has
+    been). The reason names exactly which of those applied
+    (`"bundled"|"hub"|"external"|"pinned"|"unmanaged"`), so a caller can
+    offer the fix that actually applies (adopt vs. unpin vs. "this is owned
+    elsewhere, don't try"). ``(None, None)`` -- never a guessed
+    ``(False, None)`` -- when the provenance module isn't importable or
+    anything about the check raises: an unknown answer must never be read as
+    "safe to write"."""
     if provenance is None:
-        return None
+        return None, None
     if external:
-        return True
+        return True, "external"
     try:
-        if provenance.is_bundled(name) or provenance.is_hub_installed(name):
-            return True
+        if provenance.is_bundled(name):
+            return True, "bundled"
+        if provenance.is_hub_installed(name):
+            return True, "hub"
         if bool(provenance.get_record(name).get("pinned")):
-            return True
+            return True, "pinned"
         if not provenance.is_curator_managed(name):
-            return True
-        return False
+            return True, "unmanaged"
+        return False, None
     except Exception:
-        return None
+        return None, None
+
+
+def protected_reason_hint(reason: Optional[str], name: str) -> str:
+    """The concrete action for a skill that can't be auto-linked, keyed by
+    its `protected_reason`: a curator command for the two states a human can
+    reverse (`"unmanaged"` -> adopt it; `"pinned"` -> unpin it), or an
+    explanation for the three externally-owned ones
+    (`"bundled"|"hub"|"external"`) where patching would just be overwritten
+    later and there is no command to run at all. Anything else (``None``,
+    or a future reason this function doesn't recognize yet) falls back to
+    the same curator-adopt suggestion this wording used before
+    `protected_reason` existed, so an older/degraded index that only knows
+    `protected: True` keeps producing today's exact text."""
+    if reason == "pinned":
+        return f"hermes curator unpin {name}"
+    if reason in ("bundled", "hub", "external"):
+        return (
+            "installed from outside the local library; an edit would be overwritten on "
+            "update. Leave it unlinked; the reference's skills: header still links this side"
+        )
+    return f"hermes curator adopt {name}"
 
 
 # --- SKILL.md / reference parsing -------------------------------------------
@@ -485,7 +529,7 @@ def _build_index() -> Dict[str, Any]:
     stopwords = _final_stopwords(list(product_skills.values()))
     for rec in product_skills.values():
         rec["terms"] = rec["terms"] - stopwords
-        rec["protected"] = _compute_protected(provenance, rec["name"], rec["external"])
+        rec["protected"], rec["protected_reason"] = _compute_protected(provenance, rec["name"], rec["external"])
     for ref in references:
         ref["terms"] = ref["terms"] - stopwords
 
@@ -620,7 +664,8 @@ def _skills_for_terms(index: Dict[str, Any], terms: Set[str], named_by_refs: Set
         return []
     out = [
         {"name": rec["name"], "description": rec["description"], "category": rec["category"],
-         "linked": rec["linked"], "protected": rec["protected"], "ref_names_skill": rec["name"] in named_by_refs}
+         "linked": rec["linked"], "protected": rec["protected"], "protected_reason": rec.get("protected_reason"),
+         "ref_names_skill": rec["name"] in named_by_refs}
         for rec in index["skills"].values()
         if (terms and rec["terms"] & terms) or rec["name"] in named_by_refs
     ]
@@ -802,6 +847,7 @@ def _match_skill(name: str) -> Optional[Dict[str, Any]]:
         "linked": rec["linked"],
         "ref_names_skill": ref_names_skill,
         "protected": rec["protected"],
+        "protected_reason": rec.get("protected_reason"),
     }
 
 
@@ -872,6 +918,7 @@ def _products_index() -> List[Dict[str, Any]]:
         obs_by_skill.setdefault(obs["skill"], set()).add(obs["origin"])
         obs_by_skill_file.setdefault((obs["skill"], obs["file_path"]), set()).add(obs["origin"])
 
+    all_candidates = _promotion_candidates(None)
     all_skills = list(index["skills"].values())
     rows: List[Dict[str, Any]] = []
     claimed_skill_names: Set[str] = set()
@@ -914,8 +961,10 @@ def _products_index() -> List[Dict[str, Any]]:
                 if not skill["linked"]:
                     missing_links.append(f"{skill['name']} lacks related_skills: [browser-bridge]")
 
+        promote = _candidates_for_group(all_candidates, {r["file"] for r in group["refs"]},
+                                         {s["name"] for s in attached})
         rows.append(_products_index_row(group["declared_products"], terms, group["refs"], attached, origins,
-                                         missing_links, named_skills))
+                                         missing_links, named_skills, promote))
 
     # Skill-only groups: a qualifying skill (linked, has its own
     # metadata.browser_bridge block, or has an observed origin) that no
@@ -943,8 +992,9 @@ def _products_index() -> List[Dict[str, Any]]:
             names = ", ".join(sorted(s["name"] for s in attached))
             missing_links.append(f"no bridge reference exists yet for this product (covered by: {names})")
 
+        promote = _candidates_for_group(all_candidates, set(), {s["name"] for s in attached})
         rows.append(_products_index_row(set(skill["products_declared"]), terms, [], attached, origins,
-                                         missing_links, set()))
+                                         missing_links, set(), promote))
 
     rows.sort(key=lambda row: (0 if row["missing_links"] else 1, ",".join(row["products"]) or ",".join(row["terms"])))
     return rows
@@ -953,6 +1003,7 @@ def _products_index() -> List[Dict[str, Any]]:
 def _products_index_row(
     declared_products: Set[str], terms: Set[str], refs: List[Dict[str, Any]],
     attached_skills: List[Dict[str, Any]], origins: Set[str], missing_links: List[str], named_skills: Set[str],
+    promote: "List[Dict[str, Any]] | tuple" = (),
 ) -> Dict[str, Any]:
     return {
         "products": sorted(declared_products) if declared_products else sorted(terms),
@@ -960,12 +1011,32 @@ def _products_index_row(
         "bridge_references": [{"file": r["file"], "heading": r["heading"]} for r in sorted(refs, key=lambda r: r["file"])],
         "product_skills": sorted(
             [{"name": s["name"], "linked": s["linked"], "protected": s["protected"],
+              "protected_reason": s.get("protected_reason"),
               "ref_names_skill": s["name"] in named_skills} for s in attached_skills],
             key=lambda d: d["name"],
         ),
         "origins": sorted(origins),
         "missing_links": missing_links,
+        "promote": list(promote),
     }
+
+
+def _candidates_for_group(
+    all_candidates: List[Dict[str, Any]], ref_files: Set[str], skill_names: Set[str]
+) -> List[Dict[str, Any]]:
+    """The promotion candidates (rev2) relevant to one `products_index()`
+    row: a reference-observation candidate whose `file_path` is one of this
+    group's own reference files, or a product-skill candidate (`file_path`
+    empty) whose `skill` is one of this group's attached skills. Sorted by
+    most-used first and capped at `_PROMOTE_ROW_CAP` -- the umbrella view
+    (skill_hooks.py's `_trim_row`) trims every list to 3 anyway, but the CLI
+    reads this list directly and shouldn't see an unbounded one."""
+    matched = [
+        c for c in all_candidates
+        if (c["file_path"] and c["file_path"] in ref_files) or (not c["file_path"] and c["skill"] in skill_names)
+    ]
+    matched.sort(key=lambda c: (-c["uses"], c["skill"], c["file_path"]))
+    return matched[:_PROMOTE_ROW_CAP]
 
 
 def record_used(origin: str, skill: str, file_path: str = "", source: str = "used") -> None:
@@ -1000,3 +1071,143 @@ def record_used(origin: str, skill: str, file_path: str = "", source: str = "use
         state.record_skill_link_observation(origin, skill, file_path or "", source)
     except Exception:
         pass
+
+
+# --- promotion to the origin tier (rev2) -------------------------------------
+
+def promotion_candidates(origin: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Observed (origin, skill[, file_path]) bindings (SL1.6) seen at least
+    `PROMOTE_AFTER_USES` times whose target does not already declare that
+    exact origin in its own header -- the shared "this has been used enough
+    times, write it down" signal SL2's block, SL3's suggestions, and SL5's
+    CLI all read from. A reference declares an origin via its header's
+    `origins:`; a product skill via `metadata.browser_bridge.origins`.
+
+    ``origin`` narrows to one tab's origin (what SL2 checks per block);
+    omitted, every qualifying pair in the whole library comes back (SL3's
+    umbrella/product-skill views, SL5's CLI, and this module's own
+    `products_index()`). Each row is
+    ``{"origin", "skill", "file_path", "uses", "grade"}`` -- ``grade`` is the
+    observation's own `source` (`"used"` or `"used_title"`), unchanged from
+    how ``record_used`` graded it, so a caller can still tell a
+    page-title-corroborated binding apart from a fully trusted one. Sorted
+    for determinism, not by any notion of priority -- callers pick their own
+    "best" one when they only want to show a single sentence.
+
+    Fails open to ``[]``, same as every other public function here.
+    """
+    try:
+        return _promotion_candidates(origin)
+    except Exception:
+        return []
+
+
+def _promotion_candidates(origin: Optional[str]) -> List[Dict[str, Any]]:
+    index = _get_index()
+    observations = state.list_skill_link_observations(origin=origin or "")
+    candidates: List[Dict[str, Any]] = []
+    for obs in observations:
+        if obs["count"] < PROMOTE_AFTER_USES:
+            continue
+        obs_origin = obs["origin"]
+        if obs["skill"] == BROWSER_BRIDGE_SKILL_NAME and obs["file_path"]:
+            ref = _find_reference(index, obs["file_path"])
+            if ref is None or obs_origin in ref["origins"]:
+                continue  # unknown reference, or the header already names this origin
+        else:
+            rec = index["skills"].get(obs["skill"])
+            if rec is None or obs_origin in rec["origins"]:
+                continue
+        candidates.append({
+            "origin": obs_origin, "skill": obs["skill"], "file_path": obs["file_path"],
+            "uses": obs["count"], "grade": obs["source"],
+        })
+    candidates.sort(key=lambda c: (c["origin"], c["skill"], c["file_path"]))
+    return candidates
+
+
+def promotion_sentence(candidate: Dict[str, Any]) -> str:
+    """The one-sentence nudge for a single `promotion_candidates()` row:
+    write the observed origin into the target's own header so a future visit
+    matches by `origin` (the strongest signal) instead of whatever weaker one
+    got it here. Never echoes the page's title -- only the origin, the
+    file/skill name, and the use count, none of which the page authored."""
+    origin = candidate.get("origin", "")
+    uses = candidate.get("uses", 0)
+    skill = candidate.get("skill", "")
+    file_path = candidate.get("file_path", "")
+    if skill == BROWSER_BRIDGE_SKILL_NAME and file_path:
+        sentence = (
+            f'This site has used {file_path} {uses} times. Add origins: ["{origin}"] '
+            "to that reference's header so it matches directly."
+        )
+    else:
+        sentence = (
+            f'This site has used {skill} {uses} times. Add origins: ["{origin}"] '
+            "to that skill's metadata.browser_bridge.origins so it matches directly."
+        )
+    if candidate.get("grade") == "used_title":
+        sentence += " It was matched by the page's title, so confirm the site first."
+    return sentence
+
+
+# --- misplaced-manual guard (rev2; detect only, never fix) -------------------
+
+def _plugin_manual_path() -> Path:
+    return Path(__file__).resolve().parent / "skill" / "SKILL.md"
+
+
+def bundled_manual_misplacement(home: Optional[Path] = None) -> Optional[Dict[str, Any]]:
+    """Detect -- never fix -- the bundled manual having been deployed on top
+    of Hermes's own LEARNED skill at ``<skills_root>/browser-bridge/SKILL.md``
+    (a real incident: a deploy script copied the plugin's manual there,
+    silently discarding whatever the background reviewer had saved --
+    references, product-skill links, all of it). A local copy counts as the
+    bundled manual when its sha256 matches the plugin's own ``skill/SKILL.md``
+    byte-for-byte, or -- a hand-edited or older copy that won't hash-match --
+    when its body starts with the manual's own H1 (`BUNDLED_MANUAL_H1`).
+
+    Read-only: returns a description of what was found
+    (``{"path", "matched_by", "local_size", "bundled_size"}``), or ``None``
+    when nothing looks wrong. Never moves, restores, or writes a single byte
+    -- the fix is a human restoring the learned skill from a backup, not this
+    module attempting one (§1's "the plugin reads and suggests" rule applies
+    here too). Fails open to ``None`` on any error, same as this module's
+    other public functions.
+    """
+    try:
+        return _bundled_manual_misplacement(home)
+    except Exception:
+        return None
+
+
+def _bundled_manual_misplacement(home: Optional[Path]) -> Optional[Dict[str, Any]]:
+    plugin_manual = _plugin_manual_path()
+    if not plugin_manual.is_file():
+        return None
+    local_path = (home or _hermes_home()) / "skills" / BROWSER_BRIDGE_SKILL_NAME / "SKILL.md"
+    if not local_path.is_file():
+        return None
+    try:
+        if local_path.samefile(plugin_manual):
+            return None  # a dev setup symlinking the two together -- not a misplacement
+    except OSError:
+        pass
+
+    plugin_bytes = plugin_manual.read_bytes()
+    local_bytes = local_path.read_bytes()
+    matched_by: Optional[str] = None
+    if hashlib.sha256(local_bytes).hexdigest() == hashlib.sha256(plugin_bytes).hexdigest():
+        matched_by = "hash"
+    else:
+        _fm, body = _read_frontmatter_and_body(local_bytes.decode("utf-8", errors="replace"))
+        if body.lstrip().startswith(BUNDLED_MANUAL_H1):
+            matched_by = "heading"
+    if matched_by is None:
+        return None
+    return {
+        "path": str(local_path),
+        "matched_by": matched_by,
+        "local_size": len(local_bytes),
+        "bundled_size": len(plugin_bytes),
+    }

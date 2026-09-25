@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import threading
 from collections import OrderedDict
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
@@ -29,6 +30,14 @@ from . import skill_links
 # Hermes itself (explicit-loads-only), so a holder that never happens to read
 # SKILL.md's own §0b needs this spelled out once, in-band.
 MANUAL_LOAD = "skill_view('browser-bridge:browser-bridge')"
+
+# Where the bundled manual actually lives -- the same path __init__.py checks
+# before calling ctx.register_skill(). MANUAL_LOAD is only emitted when this
+# file exists, i.e. registration could plausibly have succeeded (rev2's
+# "manual pointer only when real" fix): a plugin dir with no skill/ directory
+# (a bad deploy, or a stripped-down dev checkout) must never tell the model to
+# load a skill that was never registered.
+_MANUAL_SKILL_PATH = Path(__file__).resolve().parent / "skill" / "SKILL.md"
 
 # skilllinks.md SL2.3/SL2.2: cap each list at 3 entries, the whole serialized
 # block at ~600 bytes, and the two process-lifetime dedupe sets at 2000
@@ -85,16 +94,21 @@ def _origin_of(url: str) -> str:
 
 # --- process-lifetime dedupe state ------------------------------------------
 #
-# Three independent bounded LRU-ish maps, one lock. `_emitted_origins` is
-# SL2.2's "once per (holder, origin) per gateway process" set; `_manual_sent`
-# is the same idea for the one-shot `manual` hint; `_last_act_origin` is
-# act's own cheap pre-filter (see `_act_should_check`) and is NOT a dedupe
-# set by itself -- it just remembers what origin act last saw for a given
-# (holder, tab) so a run of same-page clicks doesn't re-run the matcher on
-# every single call.
+# Three independent bounded LRU-ish maps, one lock. `_emitted_fingerprints`
+# is SL2.2's "once per (holder, origin) per gateway process" set, upgraded
+# (rev2) to store what was last said rather than just whether anything was:
+# a changed fingerprint re-emits even for an (holder, origin) pair already
+# seen, so a session that writes the header mid-task (the S1 case -- a block
+# emitted as "hostname" before the header exists, "origin" after) actually
+# sees the upgrade instead of being silenced by the old plain-set dedupe.
+# `_manual_sent` is the same "once per process" idea for the one-shot
+# `manual` hint; `_last_act_origin` is act's own cheap pre-filter (see
+# `_act_should_check`) and is NOT a dedupe set by itself -- it just remembers
+# what origin act last saw for a given (holder, tab) so a run of same-page
+# clicks doesn't re-run the matcher on every single call.
 
 _lock = threading.Lock()
-_emitted_origins: "OrderedDict[Tuple[str, str], None]" = OrderedDict()
+_emitted_fingerprints: "OrderedDict[Tuple[str, str], Tuple[Any, ...]]" = OrderedDict()
 _manual_sent: "OrderedDict[str, None]" = OrderedDict()
 _last_act_origin: "OrderedDict[Tuple[str, Any], str]" = OrderedDict()
 
@@ -104,14 +118,38 @@ def _evict(store: "OrderedDict[Any, Any]") -> None:
         store.popitem(last=False)
 
 
-def _mark_emitted_if_new(holder: str, origin: str) -> bool:
+def _fingerprint(
+    matched_by: Optional[str], product_skills: List[Dict[str, Any]],
+    bridge_references: List[Dict[str, Any]], has_promote: bool,
+) -> Tuple[Any, ...]:
+    """What the block would say, reduced to the fields that decide its
+    content (skilllinks.md rev2's re-emission fix): `matched_by`, the sorted
+    product-skill names, the sorted reference files, and whether a `promote`
+    suggestion exists. Two calls that would build an identical block produce
+    an identical fingerprint regardless of dict ordering or which fields the
+    size cap later trims -- the cap is a presentation detail, not a change in
+    what was actually found."""
+    return (
+        matched_by,
+        tuple(sorted(s.get("name", "") for s in product_skills)),
+        tuple(sorted(r.get("file", "") for r in bridge_references)),
+        bool(has_promote),
+    )
+
+
+def _mark_emitted_if_changed(holder: str, origin: str, fingerprint: Tuple[Any, ...]) -> bool:
+    """True (and records the new fingerprint) the first time this
+    (holder, origin) is seen, or whenever its fingerprint differs from what
+    was last emitted; False when it's an exact repeat -- SL2.2's dedupe,
+    upgraded to re-emit on a changed match rather than staying silent for the
+    rest of the process once ANY block has been sent for this pair."""
     key = (holder, origin)
     with _lock:
-        if key in _emitted_origins:
-            _emitted_origins.move_to_end(key)
+        if _emitted_fingerprints.get(key) == fingerprint:
+            _emitted_fingerprints.move_to_end(key)
             return False
-        _emitted_origins[key] = None
-        _evict(_emitted_origins)
+        _emitted_fingerprints[key] = fingerprint
+        _evict(_emitted_fingerprints)
         return True
 
 
@@ -218,11 +256,19 @@ def _learn_sentence(
     if any(s.get("protected") is False for s in unlinked):
         return _LEARN_REFERENCE_UNLINKED_WRITABLE
 
-    # Every unlinked skill is protected True or unknown (None).
-    name = unlinked[0].get("name", "")
+    # Every unlinked skill is protected True or unknown (None); protected_reason
+    # (rev2) says which of those it actually is, so the wording can point at
+    # the real fix (adopt / unpin / "this is owned elsewhere") instead of
+    # always guessing "adopt".
+    target = unlinked[0]
+    name = target.get("name", "")
+    reason = target.get("protected_reason")
+    hint = skill_links.protected_reason_hint(reason, name)
+    if reason in ("bundled", "hub", "external"):
+        return f"A bridge reference covers this product; the matching skill is {hint}."
     return (
         "A bridge reference covers this product; the matching skill isn't linked and may be "
-        f"protected. Load both; if they should link, tell the user: hermes curator adopt {name}."
+        f"protected. Load both; if they should link, tell the user: {hint}."
     )
 
 
@@ -234,9 +280,9 @@ def _block_bytes(block: Dict[str, Any]) -> int:
 
 def _enforce_size_cap(block: Dict[str, Any]) -> None:
     """Trim descriptions first, then drop list entries one at a time
-    (product_skills, then bridge_references, then load), then `learn`, then
-    `note` -- never touching `origin`/`matched_by`, the two fields worth
-    keeping even in a maximally trimmed block."""
+    (product_skills, then bridge_references, then load), then `promote`,
+    then `learn`, then `note` -- never touching `origin`/`matched_by`, the
+    two fields worth keeping even in a maximally trimmed block."""
     if _block_bytes(block) <= MAX_BLOCK_BYTES:
         return
 
@@ -272,14 +318,28 @@ def _enforce_size_cap(block: Dict[str, Any]) -> None:
     if _block_bytes(block) <= MAX_BLOCK_BYTES:
         return
 
+    block.pop("promote", None)
+    if _block_bytes(block) <= MAX_BLOCK_BYTES:
+        return
+
     block.pop("learn", None)
     if _block_bytes(block) <= MAX_BLOCK_BYTES:
         return
     block.pop("note", None)
 
 
+def _best_promotion_candidate(candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The single candidate to mention when more than one origin/target pair
+    qualifies for this origin -- most-used first, ties broken by name so the
+    choice is deterministic rather than dependent on dict/insertion order."""
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda c: (-c.get("uses", 0), c.get("skill", ""), c.get("file_path", "")))[0]
+
+
 def _build_block(
-    origin: str, matched_by: Optional[str], product_skills: List[Dict[str, Any]], bridge_references: List[Dict[str, Any]]
+    origin: str, matched_by: Optional[str], product_skills: List[Dict[str, Any]],
+    bridge_references: List[Dict[str, Any]], promote_candidates: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     product_skills = product_skills[:MAX_LIST_ITEMS]
     bridge_references = bridge_references[:MAX_LIST_ITEMS]
@@ -305,6 +365,10 @@ def _build_block(
     learn = _learn_sentence(product_skills, bridge_references)
     if learn:
         block["learn"] = learn
+
+    best_promotion = _best_promotion_candidate(promote_candidates or [])
+    if best_promotion is not None:
+        block["promote"] = skill_links.promotion_sentence(best_promotion)
 
     if matched_by == "page_title":
         block["note"] = _PAGE_TITLE_NOTE
@@ -362,8 +426,10 @@ def _apply(name: str, data: Dict[str, Any], kwargs: Dict[str, Any]) -> None:
 
     blocks: List[Dict[str, Any]] = []
     for origin, title, _tab_id in targets:
-        if not _mark_emitted_if_new(holder, origin):
-            continue
+        # The match has to be computed BEFORE the dedupe check now (rev2):
+        # re-emission depends on comparing this call's fingerprint against
+        # the last one emitted for this (holder, origin), which means
+        # knowing what this call would say before deciding whether to say it.
         try:
             match = skill_links.match_page(origin, title)
         except Exception:
@@ -371,7 +437,16 @@ def _apply(name: str, data: Dict[str, Any], kwargs: Dict[str, Any]) -> None:
         matched_by = match.get("matched_by")
         product_skills = match.get("product_skills") or []
         bridge_references = match.get("bridge_references") or []
-        block = _build_block(origin, matched_by, product_skills, bridge_references)
+        try:
+            promote_candidates = skill_links.promotion_candidates(origin)
+        except Exception:
+            promote_candidates = []
+
+        fingerprint = _fingerprint(matched_by, product_skills, bridge_references, bool(promote_candidates))
+        if not _mark_emitted_if_changed(holder, origin, fingerprint):
+            continue
+
+        block = _build_block(origin, matched_by, product_skills, bridge_references, promote_candidates)
         blocks.append(block)
         _audit_block(name, origin, matched_by, product_skills[:MAX_LIST_ITEMS], bridge_references[:MAX_LIST_ITEMS])
         if len(blocks) >= MAX_LIST_ITEMS:
@@ -380,7 +455,7 @@ def _apply(name: str, data: Dict[str, Any], kwargs: Dict[str, Any]) -> None:
     if not blocks:
         return
 
-    if _mark_manual_if_first(holder):
+    if _mark_manual_if_first(holder) and _MANUAL_SKILL_PATH.is_file():
         blocks[0]["manual"] = MANUAL_LOAD
 
     data["skills"] = blocks[0] if len(blocks) == 1 else blocks

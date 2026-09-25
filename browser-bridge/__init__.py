@@ -29,7 +29,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from . import approvals, audit, cli, config, relay, skill_hooks, state, tools
+from . import approvals, audit, cli, config, relay, skill_hooks, skill_links, state, tools
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +101,28 @@ def register(ctx) -> None:
             )
         except Exception:
             logger.exception("browser_bridge: skill registration failed")
+
+    try:
+        # rev2's misplaced-manual guard: a deploy that copies the plugin's
+        # bundled manual over Hermes's own LEARNED browser-bridge skill
+        # silently destroys what the background reviewer had saved there.
+        # Detect only -- never write -- and surface it loudly, since nothing
+        # else would ever notice.
+        misplaced = skill_links.bundled_manual_misplacement()
+        if misplaced:
+            logger.warning(
+                "browser_bridge: %s looks like the bundled manual (matched_by=%s), not Hermes's "
+                "own learned browser-bridge skill -- restore the learned skill from a backup; "
+                "the manual ships inside the plugin directory and should never be copied into a "
+                "skills directory",
+                misplaced["path"], misplaced["matched_by"],
+            )
+            audit.record(
+                "bundled_manual_misplaced", path=misplaced["path"],
+                local_size=misplaced["local_size"], bundled_size=misplaced["bundled_size"],
+            )
+    except Exception:
+        logger.exception("browser_bridge: bundled-manual misplacement check failed")
 
     try:
         # Skill Links (ProjectRules/skilllinks.md SL3): annotates skill_view

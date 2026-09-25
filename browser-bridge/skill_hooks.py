@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
@@ -37,6 +39,29 @@ _MAX_ITEMS = 3
 
 _REFERENCES_PREFIX = "references/"
 _UMBRELLA = skill_links.BROWSER_BRIDGE_SKILL_NAME  # "browser-bridge"
+
+# rev2's "count uses fairly": once per (holder, origin, skill, file_path) per
+# gateway process, so one session re-loading the same reference or product
+# skill can never reach PROMOTE_AFTER_USES on its own -- a promotion
+# candidate is meant to reflect independent uses (different tasks, likely
+# different sessions), not one session replaying the same view. Bounded and
+# never reset short of a process restart, same lifetime as skills_hint.py's
+# own dedupe sets.
+_MAX_RECORDED_USES = 2000
+_use_lock = threading.Lock()
+_recorded_uses: "OrderedDict[Tuple[str, str, str, str], None]" = OrderedDict()
+
+
+def _mark_use_if_new(holder: str, origin: str, skill: str, file_path: str) -> bool:
+    key = (holder, origin, skill, file_path)
+    with _use_lock:
+        if key in _recorded_uses:
+            _recorded_uses.move_to_end(key)
+            return False
+        _recorded_uses[key] = None
+        while len(_recorded_uses) > _MAX_RECORDED_USES:
+            _recorded_uses.popitem(last=False)
+        return True
 
 
 # --- plugin registration -----------------------------------------------------
@@ -105,7 +130,7 @@ def _transform(args: Dict[str, Any], result: Any, session_id: str, task_id: str)
         # and even then only a used-observation, never a new key.
         if name == _UMBRELLA and file_path.startswith(_REFERENCES_PREFIX) and holder:
             for origin, title in _attached_origins_for_holder(holder):
-                _record_reference_if_corroborated(origin, title, file_path)
+                _record_reference_if_corroborated(holder, origin, title, file_path)
         return None
 
     # SKILL.md view from here on.
@@ -123,7 +148,7 @@ def _transform(args: Dict[str, Any], result: Any, session_id: str, task_id: str)
     # unrelated attached tab must record nothing).
     if holder:
         for origin, title in _attached_origins_for_holder(holder):
-            _record_skill_if_corroborated(origin, title, name)
+            _record_skill_if_corroborated(holder, origin, title, name)
 
     match = skill_links.match_skill(name)
     if match is None:
@@ -139,7 +164,8 @@ def _umbrella_block() -> Dict[str, Any]:
     rows = [_trim_row(row) for row in skill_links.products_index()[:8]]
     return {
         "products": rows,
-        "note": "Products the bridge has references for; fix missing_links when you patch.",
+        "note": "Products the bridge has references for; fix missing_links when you patch, "
+                "and promote a listed origin into the matching header when a row carries one.",
     }
 
 
@@ -173,6 +199,10 @@ def _product_skill_block(match: Dict[str, Any], in_review: bool) -> Dict[str, An
         if text:
             suggested.append(f"{prefix} {text}")
 
+    promote_text = _promote_text_for_skill(match.get("name", ""))
+    if promote_text:
+        suggested.append(f"{prefix} {promote_text}")
+
     return {
         "bridge_references": trimmed_refs,
         "observed_origins": observed,
@@ -180,6 +210,20 @@ def _product_skill_block(match: Dict[str, Any], in_review: bool) -> Dict[str, An
         "link": link_state,
         "suggested": suggested,
     }
+
+
+def _promote_text_for_skill(name: str) -> Optional[str]:
+    """rev2: this skill's own promotion candidates (an observed origin used
+    enough times that isn't yet in its metadata.browser_bridge.origins), as
+    one sentence -- the same signal skills_hint.py's `promote` field and the
+    CLI's `promote:` line read, scoped here to just this skill."""
+    if not name:
+        return None
+    candidates = [c for c in skill_links.promotion_candidates() if c.get("skill") == name]
+    if not candidates:
+        return None
+    best = sorted(candidates, key=lambda c: (-c.get("uses", 0), c.get("file_path", "")))[0]
+    return skill_links.promotion_sentence(best)
 
 
 def _skill_side_text(match: Dict[str, Any], sorted_refs: List[Dict[str, Any]]) -> str:
@@ -190,9 +234,14 @@ def _skill_side_text(match: Dict[str, Any], sorted_refs: List[Dict[str, Any]]) -
                 f"one line under '## Via Browser Bridge' pointing to browser-bridge {sorted_refs[0]['file']}."
             )
         return "Add browser-bridge to this skill's metadata.hermes.related_skills."
+    reason = match.get("protected_reason")
+    name = match.get("name", "")
+    hint = skill_links.protected_reason_hint(reason, name)
+    if reason in ("bundled", "hub", "external"):
+        return f"This skill can't be auto-linked -- it's {hint}."
     return (
         "This skill can't be auto-linked (protected or unknown provenance). If it should "
-        f"link, tell the user: hermes curator adopt {match['name']}."
+        f"link, tell the user: {hint}."
     )
 
 
@@ -289,7 +338,7 @@ def _attached_origins_for_holder(holder: str, limit: int = _MAX_ITEMS) -> List[T
     return origins
 
 
-def _record_if_corroborated(origin: str, title: str, *, skill: str, file_path: str = "") -> None:
+def _record_if_corroborated(holder: str, origin: str, title: str, *, skill: str, file_path: str = "") -> None:
     """Record a (origin, skill[, file_path]) observation only when an
     INDEPENDENT ``skill_links.match_page(origin, title)`` call actually names
     this same skill/reference for that origin.
@@ -306,6 +355,14 @@ def _record_if_corroborated(origin: str, title: str, *, skill: str, file_path: s
     a trusted match by itself); every other ``matched_by`` (origin/used/
     hostname) already rests on a non-page-controlled signal and is stored as
     the fully trusted ``source="used"``.
+
+    ``holder`` gates the actual write through `_mark_use_if_new` (rev2's
+    "count uses fairly"): the corroboration check above still runs every
+    time (cheap, and needed to keep `last_seen` honest for genuinely repeat
+    uses), but a SECOND view of the exact same (holder, origin, skill,
+    file_path) in this process never bumps `count` again -- one session
+    replaying the same view must not be able to reach `PROMOTE_AFTER_USES`
+    by itself.
     """
     try:
         m = skill_links.match_page(origin, title)
@@ -317,16 +374,18 @@ def _record_if_corroborated(origin: str, title: str, *, skill: str, file_path: s
         corroborated = skill in {p["name"] for p in m.get("product_skills", [])}
     if not corroborated:
         return
+    if not _mark_use_if_new(holder, origin, skill, file_path):
+        return
     source = "used_title" if m.get("matched_by") == "page_title" else "used"
     skill_links.record_used(origin, skill, file_path, source=source)
 
 
-def _record_skill_if_corroborated(origin: str, title: str, skill: str) -> None:
-    _record_if_corroborated(origin, title, skill=skill)
+def _record_skill_if_corroborated(holder: str, origin: str, title: str, skill: str) -> None:
+    _record_if_corroborated(holder, origin, title, skill=skill)
 
 
-def _record_reference_if_corroborated(origin: str, title: str, file_path: str) -> None:
-    _record_if_corroborated(origin, title, skill=_UMBRELLA, file_path=file_path)
+def _record_reference_if_corroborated(holder: str, origin: str, title: str, file_path: str) -> None:
+    _record_if_corroborated(holder, origin, title, skill=_UMBRELLA, file_path=file_path)
 
 
 def _origin_of(url: str) -> str:

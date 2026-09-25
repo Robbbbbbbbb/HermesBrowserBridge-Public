@@ -394,18 +394,65 @@ def _skill_label(skill: dict, has_refs: bool = True) -> str:
     return f"{skill['name']} ({', '.join(parts)})"
 
 
+def _protected_reason_hints(by_reason: "dict[Optional[str], set]") -> "list[str]":
+    """One hint line per group of unlinkable skills, keyed by *why* they
+    can't be auto-linked (rev2's `protected_reason`): a curator command for
+    the two reversible states, an explanation for the three externally-owned
+    ones (no command exists), grouped separately so the operator isn't told
+    to run `hermes curator adopt` on a skill that command can't help.
+    `None` (unknown provenance) and `"unmanaged"` share the same line -- both
+    are fixed the same way, and this is also the ONLY reason this repo's own
+    bare test venv (no importable Hermes provenance module) can ever
+    actually produce."""
+    lines: "list[str]" = []
+    generic = sorted(by_reason.get(None, set()) | by_reason.get("unmanaged", set()))
+    if generic:
+        lines.append(
+            "Protected or unknown-writability skills can't be auto-linked — run "
+            f"`hermes curator adopt <name>` first (affects: {', '.join(generic)})."
+        )
+    pinned = sorted(by_reason.get("pinned", set()))
+    if pinned:
+        lines.append(
+            "Pinned skills can't be auto-linked — run `hermes curator unpin <name>` first "
+            f"(affects: {', '.join(pinned)})."
+        )
+    external_owned = sorted(
+        by_reason.get("bundled", set()) | by_reason.get("hub", set()) | by_reason.get("external", set())
+    )
+    if external_owned:
+        lines.append(
+            "Bundled/hub/external skills can't be auto-linked — installed from outside the "
+            "local library; an edit would be overwritten on update. Leave them unlinked; the "
+            f"reference's skills: header still links this side (affects: {', '.join(external_owned)})."
+        )
+    return lines
+
+
 def _cmd_skills(args: argparse.Namespace) -> int:
     rows = skill_links.products_index()
     if getattr(args, "json", False):
+        # --json is for scripts: products_index()'s own return value,
+        # unchanged. The misplacement warning below is a human-facing report
+        # line, never mixed into machine-readable output.
         print(json.dumps(rows, indent=2))
         return 0
+
+    misplaced = skill_links.bundled_manual_misplacement()
+    if misplaced:
+        print(
+            f"WARNING: {misplaced['path']} looks like the bundled manual, not Hermes's own "
+            "learned browser-bridge skill. The manual ships inside the plugin directory and "
+            "should never live in a skills directory — restore the learned skill from a backup."
+        )
+        print()
 
     if not rows:
         print(f"No bridge references or product skills found under {_skills_root()}.")
         return 0
 
     total_missing = 0
-    needs_adopt: "list[str]" = []
+    by_reason: "dict[Optional[str], set]" = {}
     for i, row in enumerate(rows):
         if i:
             print()
@@ -432,7 +479,7 @@ def _cmd_skills(args: argparse.Namespace) -> int:
         print(f"  {'skills:':<13}{skills_text}")
         for s in product_skills:
             if not s.get("linked") and s.get("protected") is not False:
-                needs_adopt.append(s["name"])
+                by_reason.setdefault(s.get("protected_reason"), set()).add(s["name"])
 
         origins = row.get("origins") or []
         print(f"  {'origins:':<13}{', '.join(origins) if origins else '(none)'}")
@@ -441,15 +488,18 @@ def _cmd_skills(args: argparse.Namespace) -> int:
         print(f"  {'missing:':<13}{'; '.join(missing_links) if missing_links else '(none)'}")
         total_missing += len(missing_links)
 
+        promote = row.get("promote") or []
+        if promote:
+            promote_text = "; ".join(skill_links.promotion_sentence(c) for c in promote)
+        else:
+            promote_text = "(none)"
+        print(f"  {'promote:':<13}{promote_text}")
+
     print()
     print(f"{len(rows)} product{'s' if len(rows) != 1 else ''}, "
           f"{total_missing} missing link{'s' if total_missing != 1 else ''}")
-    if needs_adopt:
-        names = ", ".join(sorted(set(needs_adopt)))
-        print(
-            f"Protected or unknown-writability skills can't be auto-linked — run "
-            f"`hermes curator adopt <name>` first (affects: {names})."
-        )
+    for line in _protected_reason_hints(by_reason):
+        print(line)
     return 0
 
 
