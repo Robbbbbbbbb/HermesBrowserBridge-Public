@@ -2,7 +2,7 @@
 
 <img src="docs/images/hermes-esxi.jpg" width="500" alt="ESXi and Hermes bridge">
 
-# What it is
+## What it is
 
 A Chrome extension and a Hermes gateway plugin. Together, they let a Hermes agent work in tabs you share from your own Chrome session right along side of you.
 
