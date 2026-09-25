@@ -74,11 +74,15 @@ The more Powers you give your agent, the more it can do... which coincidentally 
 
 Browser Bridge uses a custom `Skills Link` to correlate known skills with whatever you're accessing in your local browser.
 
-That means if your Hermes agent already understands how to use something like VMWare vCenter, it can correlate the known skill with the website that it is visiting. Likewise, the app helps Hermes learn that it can use Browser Bridge (when a session is active) as part of its Skills Library for VMWare vCenter in the future.
+That means if your Hermes agent already understands how to use something like VMWare vCenter, it can correlate the known skill with the website that it is visiting. Likewise, the app helps Hermes learn that it can use Browser Bridge (when a session is active) as part of its Skills Library for VMware vCenter in the future.
 
 *An example of this*:
 
-I had Hermes use Browser Bridge to access VMWare ESXI and stand up a new Ubuntu virtual machine. It learned how to interact with VMWare's web console, browse and search datastores, and how to adapt to the console's latency affecting keystroke drops. It also learned how to handle the Ubuntu OS install directly from a visual console using OCR to turn a snapshot of the console image into actionable form fields that it could use keyboard controls to manipulate.
+I had Hermes use Browser Bridge to access VMware ESXi and stand up a new Ubuntu virtual machine. It learned how to interact with VMware's web console, browse and search datastores, and how to adapt to the console's latency affecting keystroke drops. It also learned how to handle the Ubuntu OS install directly from a visual console using OCR to turn a snapshot of the console image into actionable form fields that it could use keyboard controls to manipulate.
+
+* 1st Run: 68 minutes
+* 2nd Run: 43 minutes
+* 3rd Run: 18 minutes
 
 ## Safety controls
 
