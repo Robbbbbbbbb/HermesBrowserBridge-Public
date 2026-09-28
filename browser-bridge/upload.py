@@ -280,7 +280,7 @@ def _basename(raw_path: str) -> str:
 
 
 def handle_upload(args: Dict[str, Any], **kwargs: Any) -> str:
-    device_id, err = tools_mod._resolve_device(args)
+    device_id, err = tools_mod._resolve_device(args, kwargs)
     if err:
         return err
     tab, err = tools_mod._resolve_tab_target(device_id, args, kwargs, "upload")

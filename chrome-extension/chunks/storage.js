@@ -70,6 +70,25 @@ async function setCredentials(creds) {
 async function clearCredentials() {
   await chrome.storage.local.remove(CREDENTIALS_KEY);
 }
+const ORIGIN_SILENT_MODES_KEY = "originSilentModes";
+async function getOriginSilentModes() {
+  const stored = await chrome.storage.local.get(ORIGIN_SILENT_MODES_KEY);
+  return { ...stored[ORIGIN_SILENT_MODES_KEY] ?? {} };
+}
+async function setOriginSilentMode(origin, mode) {
+  const next = { ...await getOriginSilentModes(), [origin]: mode };
+  await chrome.storage.local.set({ [ORIGIN_SILENT_MODES_KEY]: next });
+  return next;
+}
+async function clearOriginSilentMode(origin) {
+  const next = { ...await getOriginSilentModes() };
+  delete next[origin];
+  await chrome.storage.local.set({ [ORIGIN_SILENT_MODES_KEY]: next });
+  return next;
+}
+function originSilentModeArrayOf(modes) {
+  return Object.entries(modes).map(([origin, mode]) => ({ origin, mode }));
+}
 function redactionPolicyOf(settings) {
   return {
     password: settings.redactPasswords,
@@ -98,13 +117,17 @@ function leaseSecondsOf(settings) {
   return settings.unlimitedLease ? 0 : clampLeaseSeconds(settings.leaseSeconds);
 }
 export {
-  setCredentials as a,
-  getCredentials as b,
+  getOriginSilentModes as a,
+  setCredentials as b,
   clearCredentials as c,
-  clampReplayRetention as d,
-  clampLeaseSeconds as e,
+  getCredentials as d,
+  clampReplayRetention as e,
+  clampLeaseSeconds as f,
   getSettings as g,
+  clearOriginSilentMode as h,
+  setOriginSilentMode as i,
   leaseSecondsOf as l,
+  originSilentModeArrayOf as o,
   powerPolicyOf as p,
   redactionPolicyOf as r,
   setSettings as s

@@ -1,5 +1,5 @@
 name: browser-bridge
-version: "0.1.0"
+version: "0.2.4"
 description: See and act in the user's real Chrome tabs via an MV3 extension and an in-gateway WebSocket relay.
 author: Robbbbbbbbb
 homepage: https://github.com/Robbbbbbbbb/HermesBrowserBridge-Public

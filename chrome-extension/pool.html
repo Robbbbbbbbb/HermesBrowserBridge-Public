@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Hermes Browser Bridge — background</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body class="page">
+    <header class="app-header">
+      <img class="app-icon" src="icons/icon48.png" alt="" width="32" height="32" />
+      <div class="app-identity">
+        <div class="app-title-row"><span class="app-title">Hermes Browser Bridge — background</span></div>
+      </div>
+    </header>
+
+    <p class="hint-inline">
+      This window runs background requests for Hermes. It's safe to leave it minimized — it never
+      needs to be brought to the front. Closing it stops background requests until the next one
+      needs the browser again, at which point a new one like it opens automatically.
+    </p>
+
+    <label class="section-label">Background workers</label>
+    <ul id="workersList" class="tab-list"></ul>
+    <p id="workersEmpty" class="hint-inline">No background workers running.</p>
+    <div class="row">
+      <button id="stopAll" type="button" class="danger-outline" disabled>Stop all</button>
+    </div>
+
+    <script type="module" src="pool.js"></script>
+  </body>
+</html>

@@ -211,6 +211,12 @@
 
       <section id="panelHostNet" class="tab-panel" role="tabpanel" aria-labelledby="tabBtnHostNet" hidden>
         <p class="hint">Gateway <code id="gatewayUrlLine">—</code></p>
+        <!-- devices.md DV5.2: this device's place in the operator/agent-set
+             global priority order, plus the pin state -- read-only display
+             truth off device.hello/device.heartbeat (DV6). No write
+             controls here in v1; `hermes browser-bridge devices priority`
+             is the write path. -->
+        <p class="hint">Priority <span id="devicePriorityLine">—</span></p>
 
         <!-- Connection and teardown: everything above is what the user does
              day to day; these are the things they do once, or in an
@@ -242,6 +248,33 @@
             <button id="replayClear" type="button" class="danger" disabled>Clear</button>
           </div>
         </section>
+
+        <!-- ProjectRules/silentfetch.md SF6.1: per-origin control for
+             browser_bridge_silent_fetch (the hidden-worker fetch lane) on
+             the site the popup's active tab is currently showing. "Default"
+             is display-only once an override is set below — see
+             background-requests.ts's canSelectDefault for why there is no
+             way back from an explicit choice to Default from here. -->
+        <label class="section-label">Background requests <span id="backgroundReqOrigin" class="hint-inline"></span></label>
+        <p id="backgroundReqNoOrigin" class="hint-inline" hidden>Switch to a regular http(s) tab to set this.</p>
+        <div id="backgroundReqGroup" class="bg-mode-group" role="radiogroup" aria-label="Background requests for this site">
+          <button id="backgroundReqDefault" type="button" class="bg-mode-btn" role="radio">Default</button>
+          <button id="backgroundReqOff" type="button" class="bg-mode-btn" role="radio">Off</button>
+          <button id="backgroundReqAsk" type="button" class="bg-mode-btn" role="radio">Ask first</button>
+          <button id="backgroundReqAlways" type="button" class="bg-mode-btn" role="radio">Always allow</button>
+        </div>
+        <p id="backgroundReqDetail" class="hint-inline"></p>
+
+        <!-- SF6.2: the extension's own hidden-worker pool (silent-pool.ts) --
+             one row per origin currently holding a worker tab open, with a
+             per-worker Stop and a "Stop all". Polled on the same 2s cycle as
+             everything else in this popup. -->
+        <label class="section-label">Background workers</label>
+        <ul id="backgroundWorkersList" class="tab-list"></ul>
+        <p id="backgroundWorkersEmpty" class="hint-inline">No background workers running.</p>
+        <div class="row row-compact">
+          <button id="backgroundWorkersStopAll" class="danger-outline" disabled>Stop all</button>
+        </div>
       </section>
       </div>
     </section>

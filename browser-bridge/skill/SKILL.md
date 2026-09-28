@@ -1,7 +1,7 @@
 ---
 name: browser-bridge
 description: Drive the user's shared Chrome tabs through the Browser Bridge.
-version: 0.1.0
+version: 0.2.4
 author: Robbbbbbbbb
 homepage: https://github.com/Robbbbbbbbb/HermesBrowserBridge-Public
 license: MIT
@@ -133,6 +133,7 @@ writing the workaround down as a lesson.
 | Ask the user to point at the right element | `browser_bridge_ask` |
 | Resolve/answer a native `alert`/`confirm`/`prompt`/`beforeunload` | `browser_bridge_dialog` |
 | Replay an authenticated API call (the cURL-killer) | `browser_bridge_fetch` |
+| Bulk/paginated fetch against a granted origin, no tab needed | `browser_bridge_silent_fetch` |
 | See what requests the page itself made (metadata, sometimes bodies) | `browser_bridge_network` |
 | Read cookie presence/metadata, or a value if you truly need it | `browser_bridge_cookies` |
 | Write/overwrite a cookie | `browser_bridge_cookie_set` |
@@ -140,19 +141,30 @@ writing the workaround down as a lesson.
 | Read this device's download history | `browser_bridge_downloads` |
 | Check whether an HTTP basic/digest credential is staged for an origin | `browser_bridge_http_auth_status` |
 | Open a new tab at a URL and attach it | `browser_bridge_open_tab` |
-| Find devices, tabs, modes, pending approvals | `browser_bridge_status` |
+| Find devices, tabs, liveness, modes, pending approvals | `browser_bridge_status` |
+| See/prefer which device an implicit call picks | `browser_bridge_devices` |
 | Name, list, resume, rename, close or describe an agent session | `browser_bridge_session` |
 | Get every item from a long or paginated list | see §16 |
 
 Call `browser_bridge_status` before anything else, every session. It lists
-paired/online devices, attached tabs and who's driving them, the per-origin
-mode table, pending approvals, and **whether sharing is paused**
-(`paused: true`) — if so, stop and tell the user; every capability call is
-refused with `SHARING_PAUSED` until they click **Resume sharing**, regardless
-of mode. Don't retry or route around it.
+paired devices (online, and each one's liveness: alive/stale/offline),
+attached tabs and who's driving them, the per-origin mode table, pending
+approvals, and **whether sharing is paused** (`paused: true`) — if so, stop
+and tell the user; every capability call is refused with `SHARING_PAUSED`
+until they click **Resume sharing**. Don't retry or route around it.
 
 If there are no devices, tell the user to run `hermes browser-bridge pair` and
 enter the code in the extension popup.
+
+When several devices are paired, call `browser_bridge_devices` (`list`,
+`set_priority`, `clear_priority`) to see each one's liveness, rank, and
+`current_pick` — the device an implicit call would use right now. To prefer
+one device for a task, call `set_priority` with `scope: "session"` as your
+FIRST tool call (a session binds to its device on that first call and never
+moves; later calls are accepted but inert). `failed_over_from` on a result
+means your preferred device was skipped — tell the user. Writing the
+pinned GLOBAL order is refused (4261) — use a session override, or ask the user
+to unpin it.
 
 ## 1a. Fast path — every call is a round trip
 
@@ -834,6 +846,33 @@ approval on this call does not unlock bodies. If `bodies_included: false`,
 `bodies_omitted_reason` says why; use `browser_bridge_fetch` to see a body
 once you know the endpoint shape.
 
+### 9f. Headless background fetch: `browser_bridge_silent_fetch`
+
+Same idea as `browser_bridge_fetch` — Chrome's own network stack does the
+request, so a bot-managed JSON API that 403s a plain HTTP client still
+returns 200 — but from a **hidden worker tab: no attach, no lease, no
+`tab_id` ever** (never pass one). Use it instead of `browser_bridge_fetch`
+when no tab for the origin is on screen, the target is a bot-managed JSON
+API, or you're bulk-paging dozens of calls. Stay with `browser_bridge_fetch`
+for anything tied to a tab already attached and in front of the user.
+
+**Paging without blowing your context:** a response over `preview_chars`
+spills whole to a local `body_file` instead of landing inline — read it with
+`execute_code` (pull the next cursor/page field, feed it into the next
+call's `json_body`) rather than raising `preview_chars`. `cache_ttl_s` lets
+an identical repeat within that window skip the browser round trip
+(`from_cache: true`).
+
+Every origin needs its own "Background requests" grant (off / ask-first /
+always-allow in the popup, or the plugin-wide `full_implies_silent` default
+for `full` origins) — it never inherits an ordinary `attach` grant. Calls are
+rate-limited per origin (default 2/s, burst 10); exceeding it gets `4260`
+with `retry_after_s` — back off, don't loop. See §14 for `4257`–`4260` and
+what to tell the user for each.
+
+Full reference and a worked paging example: `skill_view('browser-bridge',
+file_path='references/headless-fetch.md')`.
+
 ## 10. `browser_bridge_downloads` → `browser_bridge_upload`
 
 `browser_bridge_downloads` (`tab_id`, optional `filter`/`limit`/`waitMs`)
@@ -986,6 +1025,13 @@ user something you could resolve yourself from `browser_bridge_status`.
 | 4252 | `INVALID_STEP_KIND` | G1: a `browser_bridge_act` `steps[]` entry gave both `action` and `tool` (or neither), named a `tool` that isn't one of `"snapshot"`/`"screenshot"`/`"find"`/`"read"`/`"inspect"`, or the batch asked for more than 2 `tool:"screenshot"` steps. → Give each step exactly one of `action`/`tool`, use a supported tool name, and keep `tool:"screenshot"` steps to 2 or fewer per batch. |
 | 4253 | `VIEWPORT_OUT_OF_RANGE` | `browser_bridge_snapshot`/`browser_bridge_screenshot`'s `viewport` was out of range, or the tab is shared in limited mode (see 4239). → Pass a width between 320 and 3840 and a height between 240 and 8000, or omit `viewport` to use the tab's real size. |
 | 4255 | `TAB_NOT_AGENT_OPENED` | H4: `browser_bridge_tabs action=close_opened` (or `browser_bridge_session close`'s `close_opened_tabs`) was asked to close a tab this session did not itself open with `browser_bridge_open_tab`. → Never a tab the user opened by hand or another session opened; use `browser_bridge_release` to stop driving it instead. |
+| 4257 | `SILENT_ORIGIN_NOT_GRANTED` | SF3/SF4: this origin is not granted for background (`silent.fetch`) requests. → Ask the user to allow background requests for it in the popup, or use `browser_bridge_fetch` against an attached tab instead. |
+| 4258 | `SILENT_WORKER_LAUNCH_FAILED` | SF1: the hidden worker tab for this origin could not be created or bootstrapped within its time budget. → Retrying may succeed if this was transient; if it keeps failing, tell the user the hidden worker window could not be created. |
+| 4259 | `SILENT_WORKER_KILLED` | SF1.5: the worker tab servicing this request was killed (`silent.kill` or the global kill switch) before it completed. → The user or another session stopped it mid-request; retry only if the task still applies. |
+| 4260 | `SILENT_RATE_LIMITED` | SF4.4: too many `silent.fetch` calls for this origin (default 2 req/s, burst 10). → Back off and retry rather than looping immediately. |
+| 4261 | `DEVICE_PRIORITY_PINNED` | devices.md: an agent write tried to reorder the GLOBAL device priority order while the user has it pinned. → Set a session-scoped override instead (never pinned), or ask the user to unpin it. |
+| 4262 | `DEVICE_NOT_ALIVE` | devices.md: an explicit `device_id`/name, or the device this session or tab-bound call is already pinned to, is offline or paused. → Never fails over silently; check `alive_devices` in the error and either wait for it to reconnect or retry a device-less call without `device_id`. |
+| 4263 | `NO_ALIVE_DEVICE` | devices.md: an implicit (device-less) call found no alive, unpaused device among every paired one. → Check `devices` in the error and ask the user to reconnect or resume sharing on one of them. |
 | 4300 | `TIMEOUT` | Operation timed out (often a wedged dialog). → Resolve any open dialog, then retry. |
 
 `TOKEN_INVALID`/`TOKEN_REVOKED`/`PAIR_CODE_*`/`RATE_LIMITED`/`SEQ_GAP`/

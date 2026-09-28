@@ -18,9 +18,10 @@ import secrets
 import sqlite3
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import config
+from .origins import GRANT_MODE_RANK, SILENT_MODE_RANK, canonicalize_origin, most_restrictive
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS devices (
@@ -198,6 +199,43 @@ CREATE TABLE IF NOT EXISTS device_commit_mode (
     updated_at INTEGER NOT NULL
 );
 
+-- silentfetch.md SF4.1: the per-origin, per-device BACKGROUND-REQUESTS
+-- (silent.fetch) override last validly reported over the wire
+-- (state.report -- protocol/schema.json's `origin_silent_mode`), set from
+-- the extension popup. Distinct from BOTH `grants` (the ordinary origin
+-- access mode -- read/act/fetch-from-attached-tab) and `device_default_mode`
+-- (the fleet-wide fallback for an origin `grants` has no row for): a row
+-- here only ever narrows or widens whether an ALREADY-reachable origin's
+-- silent_grants.authorize_silent_fetch() call needs a live approval, never
+-- whether the origin is reachable at all -- that is still `grants`/SSRF's
+-- job, checked first and independently. New table only, per this module's
+-- migration policy (`CREATE TABLE IF NOT EXISTS`, no `ALTER TABLE`, no
+-- `user_version`). One row per (device, origin); a mode outside {off, ask,
+-- always} is rejected outright by `set_origin_silent_mode` and this table is
+-- left exactly as it was, mirroring `device_default_mode`'s "reject, never
+-- coerce" rule -- see that function and `get_origin_silent_mode` (the read
+-- side re-checks the CHECK constraint's own invariant rather than trusting
+-- it alone, for the same "a stray direct DB edit must not be honoured"
+-- reason `get_device_default_mode` documents).
+--
+-- SF6: two amendments to the above. (1) `clear_origin_silent_mode` deletes a
+-- row outright -- the wire now accepts a `mode: "default"` report entry
+-- (protocol/schema.json's `originSilentModeReport`) meaning exactly that,
+-- since the original enum had no way to un-set an override once made. (2)
+-- `replace_origin_silent_modes` treats a reported array as this device's
+-- FULL current map and replaces every row for it in one transaction -- an
+-- origin with a row here but absent from that array is cleared the same as
+-- an explicit "default". `set_origin_silent_mode`'s own single-row upsert
+-- still exists and is still correct on its own terms; relay.py no longer
+-- calls it for a wire report (see `_apply_reported_origin_silent_mode`).
+CREATE TABLE IF NOT EXISTS origin_silent_mode (
+    device_id  TEXT NOT NULL,
+    origin     TEXT NOT NULL,
+    mode       TEXT NOT NULL CHECK (mode IN ('off', 'ask', 'always')),
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (device_id, origin)
+);
+
 -- G3.1 first-class sessions (coveragegaps.md §G3.1). A persistent, nameable,
 -- resumable identity for "the work a given conversation is doing on a given
 -- device" -- distinct from BOTH the `sessions` table above (that one is the
@@ -333,6 +371,88 @@ CREATE TABLE IF NOT EXISTS skill_link_observations (
     last_seen  INTEGER NOT NULL,
     count      INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (origin, skill, file_path)
+);
+
+-- DV2 (devices.md, "Priority state"): which paired device answers a
+-- device-less call first, and the user's pin on that choice. New tables only,
+-- per this module's migration policy (`CREATE TABLE IF NOT EXISTS`, no
+-- `ALTER TABLE`, no `user_version`) -- see this file's own DV2 section
+-- below (search "DV2 device priority") for the accessors and the fuller
+-- rationale for each column.
+--
+-- `device_priority`: the ONE global order (devices.md §1 "Scope": "One
+-- stored order for the gateway"). `rank` is this device's 0-based
+-- position from the most recent whole-order replace
+-- (`set_global_priority`) -- there is exactly one global order, so a
+-- replace clears every row in this table, not just the caller's device's
+-- row. `set_by` ("agent" or "operator") records who WROTE this row (the
+-- CHECK constraint mirrors the wire enum the same way every other
+-- strictly-validated column in this file does); `set_at` is that write's
+-- timestamp, shared by every row the same `set_global_priority` call
+-- produced.
+CREATE TABLE IF NOT EXISTS device_priority (
+    device_id TEXT PRIMARY KEY,
+    rank      INTEGER NOT NULL,
+    set_by    TEXT NOT NULL CHECK (set_by IN ('agent', 'operator')),
+    set_at    INTEGER NOT NULL
+);
+
+-- Singleton row (id=1, CHECK enforces exactly one) holding devices.md §1's
+-- pin: "a the user-set order is pinned: the agent can read it but can't
+-- reorder it until the user unpins it" (§2 rule 5). `pinned_by`/`pinned_at`
+-- name and time whoever last changed the PIN STATE itself (distinct from
+-- `device_priority.set_by`, which is who wrote the order) -- both NULL
+-- until the first `set_priority_pin` call.
+CREATE TABLE IF NOT EXISTS device_priority_meta (
+    id        INTEGER PRIMARY KEY CHECK (id = 1),
+    pinned    INTEGER NOT NULL,
+    pinned_by TEXT,
+    pinned_at INTEGER
+);
+
+-- Per-session override (devices.md §1 "Scope": "a per-session override; an
+-- agent session can override it for itself"). One row per (session_id,
+-- device_id) holding that session's own rank. No pin/meta table for this
+-- one: devices.md's pin only ever names the global order (§1's "Who sets
+-- priority" row, §2 rule 5) -- a session overriding its OWN priority is
+-- the agent's ordinary self-service, never gated by the user's pin the way a
+-- global rewrite is.
+CREATE TABLE IF NOT EXISTS session_device_priority (
+    session_id TEXT NOT NULL,
+    device_id  TEXT NOT NULL,
+    rank       INTEGER NOT NULL,
+    set_at     INTEGER NOT NULL,
+    PRIMARY KEY (session_id, device_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_device_priority_session ON session_device_priority(session_id);
+
+-- devices.md DV5 fix: `hermes browser-bridge devices rename` must survive
+-- the renamed device's next reconnect. Without this table, a rename only
+-- ever touched `devices.name` directly, and `touch_device` (called from
+-- EVERY device.hello/heartbeat with whatever `device_name` the extension
+-- itself reports) unconditionally overwrote that column right back on the
+-- next hello -- the CLI's own rename silently "worked" and then reverted
+-- within one heartbeat interval of the device coming back online, with no
+-- error or audit line marking the revert. New table only, per this
+-- module's migration policy (`CREATE TABLE IF NOT EXISTS`, no `ALTER
+-- TABLE`, no `user_version`).
+--
+-- One row per device with an ACTIVE operator override; a device with no
+-- row here has never been renamed, or had its rename cleared, and tracks
+-- whatever the extension itself reports the normal way. `set_by` is
+-- free-text (the CLI's own caller identity, "operator" today), mirroring
+-- `device_priority.set_by`'s own convention; `set_at` is the write's
+-- timestamp. `touch_device` below skips the `name` column entirely while a
+-- row exists here (see that function's own comment) -- the override is the
+-- ONLY writer of `devices.name` from that point on, until
+-- `clear_device_name_override` removes this row and hands `name` back to
+-- `touch_device`.
+CREATE TABLE IF NOT EXISTS device_name_override (
+    device_id TEXT PRIMARY KEY,
+    name      TEXT NOT NULL,
+    set_by    TEXT NOT NULL,
+    set_at    INTEGER NOT NULL
 );
 """
 
@@ -492,9 +612,24 @@ def authenticate(device_id: str, token: str) -> Optional[sqlite3.Row]:
 
 
 def touch_device(device_id: str, **fields: Any) -> None:
+    """devices.md DV5 fix: while `device_id` has an active
+    `device_name_override` row, the `name` column is NEVER written here --
+    an operator rename (`set_device_name_override`) must survive this
+    device's every future `device.hello`/`device.heartbeat`, not just the
+    one that happened to arrive before the next reconnect. Without this
+    guard, `relay.py`'s hello handler calling
+    `touch_device(device_id, name=<whatever the extension itself reports>,
+    ...)` on literally every hello would silently overwrite the override
+    right back within one reconnect, with no error and no audit line
+    marking the revert. `platform`/`browser`/`ext_version` are unaffected --
+    the override only ever covers the display NAME, never a device's other
+    self-reported metadata."""
     sets = ["last_seen = ?"]
     values: List[Any] = [_now()]
+    override_active = get_device_name_override(device_id) is not None
     for column in ("name", "platform", "browser", "ext_version"):
+        if column == "name" and override_active:
+            continue
         if fields.get(column):
             sets.append(f"{column} = ?")
             values.append(fields[column])
@@ -505,14 +640,129 @@ def touch_device(device_id: str, **fields: Any) -> None:
         conn.commit()
 
 
+def get_device_name_override(device_id: str) -> Optional[str]:
+    """devices.md DV5 fix: `device_id`'s active operator-set name override,
+    or ``None`` if it has never been renamed or its rename was cleared.
+    The one read every name-showing path below (`list_devices`, DV3's
+    `tools._resolve_device` name resolution via `_device_rows`,
+    `browser_bridge_status`, `browser_bridge_devices` list, the CLI, and
+    `touch_device`'s own write-guard above) ultimately goes through --
+    `list_devices` overlays it onto `name` for every OTHER reader, so most
+    callers never call this directly."""
+    with _lock:
+        row = connect().execute(
+            "SELECT name FROM device_name_override WHERE device_id = ?", (device_id,)
+        ).fetchone()
+    return row["name"] if row is not None else None
+
+
+def set_device_name_override(device_id: str, name: str, set_by: str) -> Optional[str]:
+    """devices.md DV5 fix (D1 -- rename is CLI/popup only, never the agent):
+    rename a paired, non-revoked device PERMANENTLY -- the override sticks
+    across every future reconnect until `clear_device_name_override` is
+    called, unlike a bare `devices.name` write, which `touch_device`
+    would otherwise overwrite on the device's very next hello.
+
+    Writes BOTH `device_name_override` (the row `touch_device`'s guard and
+    `get_device_name_override` actually check) and the `devices.name`
+    column itself, in the same transaction -- kept in sync for any reader
+    that still queries that column directly (an older build, an ad-hoc SQL
+    script, a support export) rather than going through this module's own
+    accessors.
+
+    Returns the device's previous EFFECTIVE name (the prior override if one
+    existed, else the `devices.name` column) on success, for an audited
+    before/after the same way every other setter in this module returns
+    one -- or ``None`` when no active (non-revoked) device with this id
+    exists, writing nothing.
+
+    `name` is trusted here exactly as given -- validation (length, control
+    characters) is the caller's job (hermes_plugin/cli.py's
+    `_validate_device_name`), mirroring this module's usual split between
+    "this function persists a value" and "the caller decides if the value
+    is fit to persist". `set_by` is free-text, recorded verbatim (the CLI's
+    own caller identity, "operator" today) -- same as `device_priority`'s
+    own `set_by` column."""
+    now = _now()
+    with _lock:
+        conn = connect()
+        row = conn.execute(
+            "SELECT name FROM devices WHERE id = ? AND revoked_at IS NULL", (device_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        override_row = conn.execute(
+            "SELECT name FROM device_name_override WHERE device_id = ?", (device_id,)
+        ).fetchone()
+        before = override_row["name"] if override_row is not None else row["name"]
+        conn.execute(
+            "INSERT INTO device_name_override (device_id, name, set_by, set_at) VALUES (?, ?, ?, ?)"
+            " ON CONFLICT(device_id) DO UPDATE SET name = excluded.name, set_by = excluded.set_by,"
+            " set_at = excluded.set_at",
+            (device_id, name, set_by, now),
+        )
+        conn.execute("UPDATE devices SET name = ? WHERE id = ?", (name, device_id))
+        conn.commit()
+    return before
+
+
+def clear_device_name_override(device_id: str) -> Optional[str]:
+    """devices.md DV5 fix: drop `device_id`'s active name override, if any.
+    Returns the override name that was just cleared, or ``None`` when there
+    was no override row (a no-op -- nothing is written, and the caller
+    should treat this as "nothing to clear" rather than a real change to
+    audit).
+
+    The `devices.name` column is left exactly as it is by this call --
+    `touch_device`'s write-guard above stops blocking the `name` column the
+    instant this row is gone, so the device's own self-reported name (from
+    its extension settings) takes over again starting with its next
+    `device.hello`/`device.heartbeat`, not immediately. There is no
+    "restore the pre-override name" here: devices.md's own decision is
+    that clearing hands control back to the DEVICE's report, not to
+    whatever name predates the override."""
+    with _lock:
+        conn = connect()
+        row = conn.execute(
+            "SELECT name FROM device_name_override WHERE device_id = ?", (device_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        conn.execute("DELETE FROM device_name_override WHERE device_id = ?", (device_id,))
+        conn.commit()
+    return row["name"]
+
+
 def list_devices(include_revoked: bool = False) -> List[Dict[str, Any]]:
+    """Every paired device (or every device including revoked ones, with
+    `include_revoked=True`), each dict's `name` overlaid with its active
+    `device_name_override` when one exists (devices.md DV5 fix) -- this is
+    the SINGLE overlay point every other name-showing read path in this
+    codebase relies on (see `get_device_name_override`'s own docstring for
+    the full list), so a caller here never has to know the override table
+    exists at all. `set_device_name_override` already keeps `devices.name`
+    itself in sync too, so this overlay is belt-and-braces against the two
+    ever drifting apart (a direct DB edit, a future code path that forgets
+    to update both) -- the same "write-side sync AND read-side re-check"
+    discipline `get_mode`'s grants-table handling and `get_device_default_mode`'s
+    own defensive read both already use."""
     query = "SELECT * FROM devices"
     if not include_revoked:
         query += " WHERE revoked_at IS NULL"
     query += " ORDER BY created_at"
     with _lock:
         rows = connect().execute(query).fetchall()
-    return [dict(row) for row in rows]
+        overrides = {
+            r["device_id"]: r["name"] for r in connect().execute("SELECT device_id, name FROM device_name_override").fetchall()
+        }
+    devices = []
+    for row in rows:
+        device = dict(row)
+        override = overrides.get(device["id"])
+        if override is not None:
+            device["name"] = override
+        devices.append(device)
+    return devices
 
 
 def revoke_device(device_id: str) -> bool:
@@ -522,6 +772,22 @@ def revoke_device(device_id: str) -> bool:
             "UPDATE devices SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
             (_now(), device_id),
         )
+        # DV2 (devices.md): drop this device's priority rows -- both the
+        # global order and every session's own override -- in the SAME
+        # transaction as the revoke itself. This is the write-side half of
+        # the write-side vs. read-side lesson; get_global_priority and
+        # get_session_priority below still re-check `revoked_at IS NULL` on
+        # every read regardless, so a row that somehow lingers (a direct DB
+        # edit, an old build, a future code path that forgets this) can
+        # never be handed back as a candidate either way.
+        conn.execute("DELETE FROM device_priority WHERE device_id = ?", (device_id,))
+        conn.execute("DELETE FROM session_device_priority WHERE device_id = ?", (device_id,))
+        # devices.md DV5 fix: same rule for a name override -- a revoked
+        # device's name is no longer anyone's to override, and a lingering
+        # row here would otherwise keep blocking `touch_device`'s `name`
+        # column forever for an id nothing can re-pair under (device ids
+        # are never reused).
+        conn.execute("DELETE FROM device_name_override WHERE device_id = ?", (device_id,))
         conn.commit()
         return cur.rowcount > 0
 
@@ -548,14 +814,64 @@ def has_active_device(offline_after_seconds: Optional[int] = None) -> bool:
 def set_grant(device_id: str, origin: str, mode: str) -> None:
     if mode not in ("off", "request", "full"):
         raise ValueError(f"invalid mode: {mode}")
+    # Canonicalize on write (case, default port, trailing dot, IDN) so a
+    # spelling variant of an already-granted origin upserts the SAME row
+    # instead of creating a second one under a different key — the write-side
+    # half of the read-side canonicalization below.
+    origin = canonicalize_origin(origin)
+    now = _now()
     with _lock:
         conn = connect()
+        # A pre-existing non-canonical row for this same real origin (from
+        # before this fix shipped, or a direct DB edit) must not just be
+        # OUT-RANKED by get_mode's most-restrictive-wins read-side rule --
+        # left in place, it would make an 'off' origin permanently stuck off:
+        # the user re-grants 'full' here, this upserts the canonical row, but
+        # the untouched legacy 'off' row would still be the more restrictive
+        # of the two on every future read, with no UI path to ever delete it
+        # (the popup only ever writes the canonical spelling). So every write
+        # first deletes this device's OTHER rows that canonicalize to the
+        # same origin, in the same transaction as the upsert -- DML, not a
+        # migration, so the CREATE TABLE IF NOT EXISTS-only policy still
+        # holds. A row no write has touched yet is still resolved by
+        # most-restrictive-wins on read (get_mode), same as before.
+        _delete_other_canonical_rows(conn, "grants", device_id, origin, extra_where={})
         conn.execute(
             "INSERT INTO grants (device_id, origin, mode, updated_at) VALUES (?, ?, ?, ?)"
             " ON CONFLICT(device_id, origin) DO UPDATE SET mode = excluded.mode, updated_at = excluded.updated_at",
-            (device_id, origin, mode, _now()),
+            (device_id, origin, mode, now),
         )
         conn.commit()
+
+
+def _delete_other_canonical_rows(
+    conn: sqlite3.Connection, table: str, device_id: str, canonical_origin: str, extra_where: Dict[str, Any],
+) -> None:
+    """Delete every row in `table` for `device_id` (optionally further
+    narrowed by `extra_where`, e.g. `capability`/`session_key`) whose `origin`
+    canonicalizes to `canonical_origin` but is not ALREADY spelled that way --
+    the write-side cleanup every origin-keyed table's own single-row setter
+    calls right before upserting the canonical row, so a stale non-canonical
+    spelling can never outlive a fresh write meant to supersede it. Read-only
+    tables and multi-row replace operations (`replace_origin_silent_modes`,
+    which already deletes and rewrites this device's entire table every
+    call) do their own cleanup and do not call this."""
+    clauses = ["device_id = ?"]
+    params: List[Any] = [device_id]
+    for column, value in extra_where.items():
+        clauses.append(f"{column} = ?")
+        params.append(value)
+    rows = conn.execute(
+        f"SELECT origin FROM {table} WHERE " + " AND ".join(clauses), params,
+    ).fetchall()
+    stale = [row["origin"] for row in rows if row["origin"] != canonical_origin and canonicalize_origin(row["origin"]) == canonical_origin]
+    if not stale:
+        return
+    for stale_origin in stale:
+        conn.execute(
+            f"DELETE FROM {table} WHERE " + " AND ".join(clauses) + " AND origin = ?",
+            [*params, stale_origin],
+        )
 
 
 def get_mode(device_id: str, origin: str) -> str:
@@ -565,13 +881,31 @@ def get_mode(device_id: str, origin: str) -> str:
     (`effective_default_mode`, which itself falls back to config.py's
     `default_mode` when the device has never validly reported one); config's
     `default_mode` is therefore only ever reached through that second call,
-    never duplicated here."""
+    never duplicated here.
+
+    Compares canonically (case, default port, trailing dot, IDN — see
+    `origins.canonicalize_origin`): a grant recorded under one spelling of an
+    origin is honoured for a lookup under any equivalent spelling, so
+    `https://EXAMPLE.com:443/x`'s origin still finds the `https://example.com`
+    row. Every row for this device that canonicalizes to the same origin is
+    read (not just one, which is why this can no longer be a single indexed
+    `SELECT ... WHERE origin = ?`) — a pre-existing DB can hold more than one
+    spelling of the same origin with DIFFERENT modes (this table's own
+    migration policy is `CREATE TABLE IF NOT EXISTS`, never `ALTER TABLE`, so
+    stale non-canonical rows are never rewritten out from under a running
+    gateway); when that happens the MOST RESTRICTIVE recorded mode wins
+    (`origins.GRANT_MODE_RANK`: off < request < full), so a permissive
+    spelling can never override a stricter one made for the same real
+    origin."""
+    canonical = canonicalize_origin(origin)
     with _lock:
-        row = connect().execute(
-            "SELECT mode FROM grants WHERE device_id = ? AND origin = ?", (device_id, origin)
-        ).fetchone()
-    if row is not None:
-        return row["mode"]
+        rows = connect().execute(
+            "SELECT origin, mode FROM grants WHERE device_id = ?", (device_id,)
+        ).fetchall()
+    modes = [row["mode"] for row in rows if canonicalize_origin(row["origin"]) == canonical]
+    resolved = most_restrictive(modes, GRANT_MODE_RANK)
+    if resolved is not None:
+        return resolved
     return effective_default_mode(device_id)
 
 
@@ -810,19 +1144,21 @@ def effective_commit_mode(device_id: str) -> str:
 
 
 def has_explicit_grant(device_id: str, origin: str) -> bool:
-    """True iff a grants-table row exists for this exact (device, origin) —
-    i.e. ``get_mode`` would NOT be falling back to ``config.py``'s
-    ``default_mode``. G2.2.13 (acting inside frames): an embedded frame's
-    origin must never be authorized purely because the fleet's tab-level
-    default happens to be permissive (the same rule ``tools.py``'s
-    ``_reconcile_frame_origins`` already applies to snapshot text) — this is
-    the primitive that lets ``_authorize``'s ``require_explicit_grant`` flag
-    enforce that without duplicating the grants-table query."""
+    """True iff a grants-table row exists for this (device, origin) —
+    compared canonically, same as ``get_mode`` — i.e. ``get_mode`` would NOT
+    be falling back to ``config.py``'s ``default_mode``. G2.2.13 (acting
+    inside frames): an embedded frame's origin must never be authorized
+    purely because the fleet's tab-level default happens to be permissive
+    (the same rule ``tools.py``'s ``_reconcile_frame_origins`` already
+    applies to snapshot text) — this is the primitive that lets
+    ``_authorize``'s ``require_explicit_grant`` flag enforce that without
+    duplicating the grants-table query."""
+    canonical = canonicalize_origin(origin)
     with _lock:
-        row = connect().execute(
-            "SELECT 1 FROM grants WHERE device_id = ? AND origin = ?", (device_id, origin)
-        ).fetchone()
-    return row is not None
+        rows = connect().execute(
+            "SELECT origin FROM grants WHERE device_id = ?", (device_id,)
+        ).fetchall()
+    return any(canonicalize_origin(row["origin"]) == canonical for row in rows)
 
 
 def list_grants(device_id: str = "") -> List[Dict[str, Any]]:
@@ -834,6 +1170,196 @@ def list_grants(device_id: str = "") -> List[Dict[str, Any]]:
     with _lock:
         rows = connect().execute(query + " ORDER BY origin", params).fetchall()
     return [dict(row) for row in rows]
+
+
+# --- silentfetch.md SF4.1: per-origin silent-fetch mode --------------------
+
+def get_origin_silent_mode(device_id: str, origin: str) -> Optional[str]:
+    """The `origin_silent_mode` row(s) for (device_id, origin), compared
+    canonically (case, default port, trailing dot, IDN — same as
+    `get_mode`), or ``None`` if none exist — deliberately NOT any
+    config-default fallback; ``silent_grants.authorize_silent_fetch`` owns
+    what "no explicit override" means. Defensive on read as well as on write
+    (the write-side vs read-side lesson this table's own SCHEMA comment
+    names): a row somehow containing anything outside {off, ask, always} —
+    the CHECK constraint should make this unreachable, but nothing here
+    trusts a constraint alone as the sole line of defence, e.g. a migration
+    or a direct DB edit — is dropped (audited by the caller as "ignored bogus
+    row"), never treated as the stored garbage. When more than one stored
+    spelling of the same canonical origin has a valid row, the MOST
+    RESTRICTIVE wins (`origins.SILENT_MODE_RANK`: off < ask < always), same
+    principle as `get_mode`'s grants-table conflict rule."""
+    canonical = canonicalize_origin(origin)
+    with _lock:
+        rows = connect().execute(
+            "SELECT origin, mode FROM origin_silent_mode WHERE device_id = ?", (device_id,)
+        ).fetchall()
+    modes = [row["mode"] for row in rows if canonicalize_origin(row["origin"]) == canonical]
+    return most_restrictive(modes, SILENT_MODE_RANK)
+
+
+def set_origin_silent_mode(device_id: str, origin: str, reported: Any) -> Optional[str]:
+    """Persist one `origin_silent_mode` entry exactly as it arrived on the
+    wire (state.report's `origin_silent_mode` array — see relay.py's
+    `_apply_reported_origin_silent_mode`), strictly validated: only the
+    literal strings "off", "ask" or "always" are accepted. Anything else —
+    wrong type, a stray casing, an old/misbehaving build sending something
+    outside the enum — is REJECTED outright: nothing is written, and this
+    returns ``None`` so the caller can audit the rejection for that one
+    (origin, mode) entry and leave whatever this device last validly
+    reported for THIS origin (or nothing at all) exactly as it was, per
+    `set_device_default_mode`'s "reject, never coerce" rule.
+
+    Row-level, keyed on (device_id, origin) — always the authenticated
+    connection's own device_id (relay.py never takes this from a param), so
+    a device can only ever set its own origins, never another device's.
+    Canonicalized on write (see `set_grant`'s identical comment) so a
+    spelling variant upserts the same row a later lookup under any
+    equivalent spelling would find.
+
+    Returns the stored mode on success, so callers can diff it against a
+    `get_origin_silent_mode()` taken before the call and audit an actual
+    change the same way `set_device_default_mode` does for its own table.
+    """
+    if reported not in ("off", "ask", "always"):
+        return None
+    origin = canonicalize_origin(str(origin or ""))
+    if not origin:
+        return None
+    now = _now()
+    with _lock:
+        conn = connect()
+        # Same write-side cleanup as set_grant -- see that function's comment.
+        _delete_other_canonical_rows(conn, "origin_silent_mode", device_id, origin, extra_where={})
+        conn.execute(
+            "INSERT INTO origin_silent_mode (device_id, origin, mode, updated_at) VALUES (?, ?, ?, ?)"
+            " ON CONFLICT(device_id, origin) DO UPDATE SET mode = excluded.mode, updated_at = excluded.updated_at",
+            (device_id, origin, reported, now),
+        )
+        conn.commit()
+    return reported
+
+
+def list_origin_silent_modes(device_id: str = "") -> List[Dict[str, Any]]:
+    query = "SELECT device_id, origin, mode, updated_at FROM origin_silent_mode"
+    params: tuple = ()
+    if device_id:
+        query += " WHERE device_id = ?"
+        params = (device_id,)
+    with _lock:
+        rows = connect().execute(query + " ORDER BY origin", params).fetchall()
+    return [dict(row) for row in rows]
+
+
+def clear_origin_silent_mode(device_id: str, origin: str) -> None:
+    """SF6 'Clear to Default': delete exactly one (device_id, origin) row,
+    the one operation `set_origin_silent_mode` above deliberately has no way
+    to do (it only ever inserts/updates, never removes). A no-op when no such
+    row exists — the caller (relay.py's `_apply_reported_origin_silent_mode`)
+    is expected to diff the origin's `get_origin_silent_mode` before/after and
+    only audit a real change, not every call to this function."""
+    with _lock:
+        conn = connect()
+        conn.execute("DELETE FROM origin_silent_mode WHERE device_id = ? AND origin = ?", (device_id, origin))
+        conn.commit()
+
+
+# SF6 'Lost changes': the wire cap on one origin_silent_mode report — see
+# relay.py's `_apply_reported_origin_silent_mode` for why an oversized report
+# is refused wholesale rather than partially applied.
+MAX_ORIGIN_SILENT_MODE_ENTRIES = 1000
+
+
+def replace_origin_silent_modes(device_id: str, entries: Any) -> Dict[str, Any]:
+    """SF6 'Lost changes': REPLACE this device's entire origin_silent_mode
+    table in one transaction, rather than upserting only the origins named in
+    `entries` (the old `_apply_reported_origin_silent_mode` behaviour, which
+    is exactly what let the gateway's table drift from the popup's local map
+    after a dropped frame — an origin the popup had since cleared, or one
+    whose change never arrived, stayed exactly as it last was, forever).
+    `entries` is now understood to be the device's FULL current map, sent in
+    whole every time (device.hello, device.heartbeat, and immediately on a
+    popup change) — see protocol/schema.json's `origin_silent_mode` for the
+    full contract this implements.
+
+    Returns ``{"overflow": True, "count": N}`` and touches NOTHING when
+    ``entries`` is not a list or has more than MAX_ORIGIN_SILENT_MODE_ENTRIES
+    items — a device reporting an enormous map is refused outright, the same
+    "reject, never guess" rule every other reported field in this module
+    follows, not partially applied and not silently truncated.
+
+    Otherwise returns ``{"overflow": False, "applied": {origin: mode},
+    "rejected": [(origin, reported_mode), ...]}`` so the caller can audit a
+    precise diff against whatever `list_origin_silent_modes` returned before
+    this call. Each entry is validated independently:
+      - `mode` "off"/"ask"/"always" -> that origin gets exactly that row.
+      - `mode` "default" -> that origin gets NO row (cleared) — see
+        protocol/schema.json's `originSilentModeReport` definition.
+      - an entry with no usable `origin` string at all -> skipped outright,
+        changes nothing (not even a rejection — there is no origin to blame
+        it on).
+      - anything else for a recognisable origin (wrong type, unrecognised
+        mode string) -> REJECTED and audited, but that origin's EXISTING row
+        (whatever `list_origin_silent_modes` held for it before this call)
+        is carried over UNCHANGED, never cleared. This is deliberate and
+        fixes an earlier version of this function that cleared the origin
+        instead: a REPLACE that fails open on one garbled entry — silently
+        falling an explicit "off" back to whatever the device-wide default
+        resolves to, which is usually zero-touch — is exactly the kind of
+        bug this table exists to prevent. "Absent from a well-formed report"
+        (never mentioned, no entry at all) still clears an origin, same as
+        an explicit "default" — only a malformed or unrecognised entry for
+        an origin PRESERVES it. An origin absent from `entries` because the
+        whole report was well-formed and simply had nothing to say about it
+        is not "rejected"; only an actual entry with a bad mode is.
+
+    Row-level, keyed on `device_id` — always the authenticated connection's
+    own id (relay.py never takes this from a param), so a device can only
+    ever replace its OWN table, never another device's.
+    """
+    if not isinstance(entries, list) or len(entries) > MAX_ORIGIN_SILENT_MODE_ENTRIES:
+        return {"overflow": True, "count": len(entries) if isinstance(entries, list) else -1}
+
+    applied: Dict[str, str] = {}
+    rejected: List[Tuple[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        origin = canonicalize_origin(str(entry.get("origin") or ""))
+        if not origin:
+            continue
+        mode = entry.get("mode")
+        if mode == "default":
+            continue  # cleared -- explicitly, not left out of the replacement set
+        if mode not in ("off", "ask", "always"):
+            rejected.append((origin, mode))
+            continue
+        applied[origin] = mode
+
+    # A rejected entry for an origin that already had a row keeps that row
+    # exactly as it was -- never falls back to "no override" just because
+    # one report was garbled. A duplicate valid entry for the same origin
+    # elsewhere in this array always wins (checked via `origin not in
+    # applied`), regardless of which one came first. `existing` is keyed
+    # canonically too (a pre-existing non-canonical row still counts as "an
+    # existing row for this origin").
+    existing: Dict[str, str] = {}
+    for row in list_origin_silent_modes(device_id):
+        existing[canonicalize_origin(row["origin"])] = row["mode"]
+    for origin, _bad_mode in rejected:
+        if origin in existing and origin not in applied:
+            applied[origin] = existing[origin]
+
+    now = _now()
+    with _lock:
+        conn = connect()
+        conn.execute("DELETE FROM origin_silent_mode WHERE device_id = ?", (device_id,))
+        conn.executemany(
+            "INSERT INTO origin_silent_mode (device_id, origin, mode, updated_at) VALUES (?, ?, ?, ?)",
+            [(device_id, origin, mode, now) for origin, mode in applied.items()],
+        )
+        conn.commit()
+    return {"overflow": False, "applied": applied, "rejected": rejected}
 
 
 # --- sessions --------------------------------------------------------------
@@ -863,9 +1389,21 @@ def close_session(session_id: str) -> None:
 # no scrubbing of its own.
 
 def set_session_grant(device_id: str, session_key: str, origin: str, capability: str, ttl_seconds: int) -> None:
+    # Canonicalize on write -- see set_grant's comment; same reasoning here so
+    # a session grant made under one spelling upserts the same row a later
+    # spelling variant would look up, instead of accumulating one row per
+    # spelling ever seen.
+    origin = canonicalize_origin(origin)
     now = _now()
     with _lock:
         conn = connect()
+        # Same write-side cleanup as set_grant, narrowed to this session_key +
+        # capability (the rest of this table's primary key) so a stale
+        # spelling under a DIFFERENT session/capability is left alone.
+        _delete_other_canonical_rows(
+            conn, "session_grants", device_id, origin,
+            extra_where={"session_key": session_key, "capability": capability},
+        )
         conn.execute(
             "INSERT INTO session_grants (device_id, session_key, origin, capability, granted_at, expires_at)"
             " VALUES (?, ?, ?, ?, ?, ?)"
@@ -877,26 +1415,43 @@ def set_session_grant(device_id: str, session_key: str, origin: str, capability:
 
 
 def get_session_grant(device_id: str, session_key: str, origin: str, capability: str) -> Optional[Dict[str, Any]]:
+    """Compares canonically, same as ``get_mode``: a session grant recorded
+    under one spelling of an origin is honoured for a lookup under any
+    equivalent spelling. This is an existence grant, not a graded mode, so
+    when more than one stored spelling matches, the most-recently-granted
+    still-unexpired row wins (there is no restrictiveness ordering to apply —
+    every row here already means "granted")."""
     if not session_key:
         return None
+    canonical = canonicalize_origin(origin)
+    now = _now()
     with _lock:
         conn = connect()
-        row = conn.execute(
-            "SELECT * FROM session_grants WHERE device_id = ? AND session_key = ? AND origin = ? AND capability = ?",
-            (device_id, session_key, origin, capability),
-        ).fetchone()
-        if row is None:
-            return None
-        if row["expires_at"] < _now():
-            # Opportunistic cleanup -- not load-bearing (get_session_grant
-            # returning None for an expired row is what actually matters).
-            conn.execute(
+        rows = conn.execute(
+            "SELECT * FROM session_grants WHERE device_id = ? AND session_key = ? AND capability = ?",
+            (device_id, session_key, capability),
+        ).fetchall()
+        best: Optional[sqlite3.Row] = None
+        stale: List[str] = []
+        for row in rows:
+            if canonicalize_origin(row["origin"]) != canonical:
+                continue
+            if row["expires_at"] < now:
+                stale.append(row["origin"])
+                continue
+            if best is None or row["granted_at"] > best["granted_at"]:
+                best = row
+        if stale:
+            # Opportunistic cleanup -- not load-bearing (excluding expired
+            # rows from `best` above is what actually matters).
+            conn.executemany(
                 "DELETE FROM session_grants WHERE device_id = ? AND session_key = ? AND origin = ? AND capability = ?",
-                (device_id, session_key, origin, capability),
+                [(device_id, session_key, stale_origin, capability) for stale_origin in stale],
             )
             conn.commit()
+        if best is None:
             return None
-    return dict(row)
+    return dict(best)
 
 
 
@@ -910,9 +1465,16 @@ def get_session_grant(device_id: str, session_key: str, origin: str, capability:
 # written under, full stop.
 
 def set_capability_grant(device_id: str, origin: str, capability: str, ttl_seconds: int) -> None:
+    # Canonicalize on write -- see set_grant's comment.
+    origin = canonicalize_origin(origin)
     now = _now()
     with _lock:
         conn = connect()
+        # Same write-side cleanup as set_grant, narrowed to this capability
+        # (the rest of this table's primary key).
+        _delete_other_canonical_rows(
+            conn, "capability_grants", device_id, origin, extra_where={"capability": capability},
+        )
         conn.execute(
             "INSERT INTO capability_grants (device_id, origin, capability, granted_at, expires_at)"
             " VALUES (?, ?, ?, ?, ?)"
@@ -924,25 +1486,37 @@ def set_capability_grant(device_id: str, origin: str, capability: str, ttl_secon
 
 
 def get_capability_grant(device_id: str, origin: str, capability: str) -> Optional[Dict[str, Any]]:
+    """Compares canonically, same rationale and same "most-recently-granted
+    still-unexpired spelling wins" rule as ``get_session_grant``."""
+    canonical = canonicalize_origin(origin)
+    now = _now()
     with _lock:
         conn = connect()
-        row = conn.execute(
-            "SELECT * FROM capability_grants WHERE device_id = ? AND origin = ? AND capability = ?",
-            (device_id, origin, capability),
-        ).fetchone()
-        if row is None:
-            return None
-        if row["expires_at"] < _now():
-            # Opportunistic cleanup -- not load-bearing (returning None for
-            # an expired row is what actually matters; see
-            # get_session_grant's identical comment).
-            conn.execute(
+        rows = conn.execute(
+            "SELECT * FROM capability_grants WHERE device_id = ? AND capability = ?",
+            (device_id, capability),
+        ).fetchall()
+        best: Optional[sqlite3.Row] = None
+        stale: List[str] = []
+        for row in rows:
+            if canonicalize_origin(row["origin"]) != canonical:
+                continue
+            if row["expires_at"] < now:
+                stale.append(row["origin"])
+                continue
+            if best is None or row["granted_at"] > best["granted_at"]:
+                best = row
+        if stale:
+            # Opportunistic cleanup -- not load-bearing (see get_session_grant's
+            # identical comment).
+            conn.executemany(
                 "DELETE FROM capability_grants WHERE device_id = ? AND origin = ? AND capability = ?",
-                (device_id, origin, capability),
+                [(device_id, stale_origin, capability) for stale_origin in stale],
             )
             conn.commit()
+        if best is None:
             return None
-    return dict(row)
+    return dict(best)
 
 
 def clear_capability_grants(device_id: str = "", origin: str = "") -> int:
@@ -1359,6 +1933,12 @@ def close_agent_session(session_id: str) -> bool:
         cur = conn.execute(
             "UPDATE agent_sessions SET closed_at = ? WHERE id = ? AND closed_at IS NULL", (_now(), session_id)
         )
+        # DV2 (devices.md): a session's priority override dies with the
+        # session -- see set_session_priority's own comment. Unconditional
+        # (not gated on cur.rowcount, i.e. it runs even for an
+        # already-closed session) since it is only ever a cleanup of rows
+        # that should not outlive this session id either way.
+        conn.execute("DELETE FROM session_device_priority WHERE session_id = ?", (session_id,))
         conn.commit()
     return cur.rowcount > 0
 
@@ -1757,3 +2337,269 @@ def list_skill_link_observations(skill: str = "", origin: str = "") -> List[Dict
     with _lock:
         rows = connect().execute(query, params).fetchall()
     return [dict(row) for row in rows]
+
+
+# =============================================================================
+# DV2 device priority (devices.md, "DV2 -- Priority state")
+#
+# Which paired device answers a device-less call, and the user's lock on that
+# choice. Reads/writes `device_priority`, `device_priority_meta` and
+# `session_device_priority` (see this file's own SCHEMA comment above each
+# table for the column-level rationale). Nothing here talks to relay.py or
+# the WS wire at all -- DV3 (`tools._resolve_device`) is the only planned
+# caller of `ordered_candidates`, layering DV1's liveness/paused filtering
+# on top of the plain ordering this section returns; DV4's
+# `browser_bridge_devices` tool is the only planned caller of the
+# set_*/get_*_priority functions and owns mapping `PriorityPinnedError` to
+# protocol error 4261 (that mapping deliberately does not live here -- see
+# `PriorityPinnedError`'s own docstring).
+#
+# Kept as its own clearly-bounded section (not interleaved with the
+# tables above it) per devices.md's build instructions: a parallel
+# DV1 builder is editing relay.py's liveness plumbing in the same window,
+# and this file is the other piece DV2 owns.
+# =============================================================================
+
+
+class PriorityPinnedError(Exception):
+    """Raised by `set_global_priority` for a `set_by="agent"` write while
+    the global order is pinned (devices.md §1 "Who sets priority": "a
+    the user-set order is pinned: the agent can read it but can't reorder it
+    until the user unpins it"; §2 rule 5: "Pin is the user's lock. A write from the
+    agent against a pinned order fails with a clear error and is
+    audited."). An "operator" write never raises this, pinned or not --
+    the CLI/popup is the pin's own owner.
+
+    Deliberately NOT a protocol-coded error: this module has no dependency
+    on `hermes_plugin.protocol` anywhere else, and devices.md's own §1
+    table allocates 4261 (DEVICE_PRIORITY_PINNED) as DV4's job to raise
+    over the wire, from `browser_bridge_devices`'s `set_priority` action --
+    catching this exception and mapping it to that code (and auditing the
+    refusal) belongs there, not here.
+    """
+
+    def __init__(self, message: str = ""):
+        super().__init__(
+            message or "the global device priority order is pinned; only the operator can change it"
+        )
+
+
+def _validate_priority_order(order: Any) -> None:
+    """Shared reject-never-coerce validation for `set_global_priority` and
+    `set_session_priority`: `order` must be a list of device id strings,
+    with no duplicates, and every id must name a device that both EXISTS
+    and is NOT revoked. Raises `ValueError` (writes nothing -- callers run
+    this before touching the database) naming the offending ids; a no-op
+    for an empty list, which both callers treat as "clear" rather than a
+    validation failure (documented on each of them)."""
+    if not isinstance(order, list) or any(not isinstance(d, str) or not d for d in order):
+        raise ValueError("order must be a list of non-empty device id strings")
+    if not order:
+        return
+    if len(order) != len(set(order)):
+        seen: set = set()
+        dupes = [d for d in order if d in seen or seen.add(d)]  # type: ignore[func-returns-value]
+        raise ValueError(f"order contains duplicate device id(s): {', '.join(sorted(set(dupes)))}")
+    placeholders = ",".join("?" * len(order))
+    with _lock:
+        rows = connect().execute(
+            f"SELECT id, revoked_at FROM devices WHERE id IN ({placeholders})", order,
+        ).fetchall()
+    found = {row["id"]: row["revoked_at"] for row in rows}
+    unknown = [d for d in order if d not in found]
+    if unknown:
+        raise ValueError(f"unknown device id(s): {', '.join(unknown)}")
+    revoked = [d for d in order if found.get(d) is not None]
+    if revoked:
+        raise ValueError(f"revoked device id(s) cannot be prioritized: {', '.join(revoked)}")
+
+
+def set_global_priority(order: List[str], set_by: str) -> None:
+    """devices.md DV2.1/§1: atomically REPLACE the whole global device
+    order with `order` (most-preferred first -- §2 rule 3's "the global
+    order"). Always a full replace, never a merge: a caller that wants to
+    move one device up reads `get_global_priority()` first and writes the
+    whole reordered list back. An empty list is accepted and means "clear
+    the global order back to nothing" (the plan left this a judgment call
+    -- documenting the choice here): every device then falls through to
+    `ordered_candidates`'s last tier, most-recent-`last_seen`.
+
+    `set_by` must be the literal string "agent" or "operator"
+    (`ValueError` otherwise, mirroring this file's other strictly-validated
+    enums). devices.md §1/§2 rule 5 (the user's pin): an "agent" write is
+    refused with `PriorityPinnedError` while the global order is pinned --
+    checked BEFORE `order` is validated at all, so a pinned refusal never
+    leaks whether the proposed order would otherwise have been accepted.
+    "operator" writes always succeed regardless of pin state (the CLI/
+    popup is the pin's own owner, per §2 rule 5's "The CLI and popup can
+    always write").
+
+    Rejects (raises `ValueError`, writes NOTHING) a non-empty `order` that
+    is not a list of strings, contains a duplicate device id, or names a
+    device id that is unknown or already revoked -- see
+    `_validate_priority_order`.
+    """
+    if set_by not in ("agent", "operator"):
+        raise ValueError(f"invalid set_by: {set_by!r}")
+    if set_by == "agent" and get_priority_pin()["pinned"]:
+        raise PriorityPinnedError()
+    _validate_priority_order(order)
+    now = _now()
+    with _lock:
+        conn = connect()
+        # One global order, so a replace clears EVERY existing row, not
+        # just rows for devices in the new `order` -- see this table's own
+        # SCHEMA comment. DELETE + executemany + one commit() is the same
+        # atomic-replace shape `replace_origin_silent_modes` above uses for
+        # its own single-transaction full-table replace.
+        conn.execute("DELETE FROM device_priority")
+        conn.executemany(
+            "INSERT INTO device_priority (device_id, rank, set_by, set_at) VALUES (?, ?, ?, ?)",
+            [(device_id, idx, set_by, now) for idx, device_id in enumerate(order)],
+        )
+        conn.commit()
+
+
+def get_global_priority() -> List[str]:
+    """The current global order, most-preferred first. Revoked devices are
+    filtered out HERE on read (the read-side half of the write-side vs.
+    read-side lesson `revoke_device`'s own comment names) -- a row can in
+    principle persist for a device revoked by some path other than
+    `revoke_device`'s own cleanup, and it must never be handed back as a
+    valid candidate regardless of how it got there."""
+    with _lock:
+        rows = connect().execute(
+            "SELECT dp.device_id FROM device_priority dp"
+            " JOIN devices d ON d.id = dp.device_id"
+            " WHERE d.revoked_at IS NULL"
+            " ORDER BY dp.rank",
+        ).fetchall()
+    return [row["device_id"] for row in rows]
+
+
+def set_priority_pin(pinned: bool, by: str) -> Dict[str, Any]:
+    """devices.md §1/§2 rule 5: set (or clear) the user's pin on the global
+    order. `by` is recorded verbatim as `pinned_by` (the CLI/popup's own
+    caller identity -- this module does no further validation of it, same
+    as every other free-text `label`/`notes` column elsewhere in this
+    file). Returns the row via `get_priority_pin()` so callers can audit an
+    actual change the same way `set_device_default_mode` et al. do for
+    their own tables."""
+    now = _now()
+    with _lock:
+        conn = connect()
+        conn.execute(
+            "INSERT INTO device_priority_meta (id, pinned, pinned_by, pinned_at) VALUES (1, ?, ?, ?)"
+            " ON CONFLICT(id) DO UPDATE SET pinned = excluded.pinned, pinned_by = excluded.pinned_by,"
+            " pinned_at = excluded.pinned_at",
+            (1 if pinned else 0, by, now),
+        )
+        conn.commit()
+    return get_priority_pin()
+
+
+def get_priority_pin() -> Dict[str, Any]:
+    """`{"pinned": bool, "pinned_by": str | None, "pinned_at": int | None}`
+    -- unpinned with no history (`pinned_by`/`pinned_at` both `None`) when
+    `set_priority_pin` has never been called."""
+    with _lock:
+        row = connect().execute(
+            "SELECT pinned, pinned_by, pinned_at FROM device_priority_meta WHERE id = 1",
+        ).fetchone()
+    if row is None:
+        return {"pinned": False, "pinned_by": None, "pinned_at": None}
+    return {"pinned": bool(row["pinned"]), "pinned_by": row["pinned_by"], "pinned_at": row["pinned_at"]}
+
+
+def set_session_priority(session_id: str, order: List[str]) -> None:
+    """devices.md DV2.1/§1: atomically REPLACE `session_id`'s own priority
+    override (most-preferred first -- §2 rule 3's "the session override
+    order"). Same shape, same validation and the same empty-list-means-
+    clear rule as `set_global_priority` -- see `_validate_priority_order`
+    and that function's docstring -- but with no pin gate at all: devices.md
+    never gives the user a lock on a SESSION's own override, only on the global
+    order (§1's "Who sets priority" row names the global order alone), so
+    an agent setting its own session's priority is ordinary self-service,
+    unconditional on `device_priority_meta`."""
+    _validate_priority_order(order)
+    now = _now()
+    with _lock:
+        conn = connect()
+        conn.execute("DELETE FROM session_device_priority WHERE session_id = ?", (session_id,))
+        conn.executemany(
+            "INSERT INTO session_device_priority (session_id, device_id, rank, set_at) VALUES (?, ?, ?, ?)",
+            [(session_id, device_id, idx, now) for idx, device_id in enumerate(order)],
+        )
+        conn.commit()
+
+
+def get_session_priority(session_id: str) -> List[str]:
+    """`session_id`'s own override order, most-preferred first, revoked
+    devices filtered out on read -- same read-side guard as
+    `get_global_priority`, same rationale."""
+    with _lock:
+        rows = connect().execute(
+            "SELECT sdp.device_id FROM session_device_priority sdp"
+            " JOIN devices d ON d.id = sdp.device_id"
+            " WHERE sdp.session_id = ? AND d.revoked_at IS NULL"
+            " ORDER BY sdp.rank",
+            (session_id,),
+        ).fetchall()
+    return [row["device_id"] for row in rows]
+
+
+def clear_session_priority(session_id: str) -> None:
+    """Delete `session_id`'s entire override, if any -- a no-op (not an
+    error) for a session with no override row. Called from
+    `close_agent_session` above so a closed session's override never
+    outlives the session itself; also safe to call directly (DV4's
+    `browser_bridge_devices` "clear" action, if it wants one)."""
+    with _lock:
+        conn = connect()
+        conn.execute("DELETE FROM session_device_priority WHERE session_id = ?", (session_id,))
+        conn.commit()
+
+
+def ordered_candidates(session_id: Optional[str]) -> List[str]:
+    """devices.md §2 rule 3's resolution order, WITHOUT liveness: "the
+    session override order → the global order → the most recent
+    heartbeat. ... Devices missing from an order sort after the ordered
+    ones, by most recent heartbeat." DV3 (`tools._resolve_device`) is
+    expected to filter/reorder this list further by liveness (alive/stale/
+    offline) and `paused` -- this function knows nothing about either;
+    it is pure ordering over non-revoked, paired devices.
+
+    `session_id=None` (a device-less call outside any agent session, or a
+    caller that never wants a session override consulted at all) skips
+    straight to the global-order tier.
+
+    Order:
+      1. `session_id`'s own override (`get_session_priority`), in rank
+         order, if `session_id` is given.
+      2. The global order (`get_global_priority`), in rank order, for any
+         device not already placed by (1).
+      3. Every other non-revoked, paired device, by most recent
+         `last_seen` descending (a device that has never checked in --
+         `last_seen IS NULL` -- sorts last of all, per §2 rule 3's "sort
+         after the ordered ones"). `last_seen` is state.py's own durable
+         proxy for "most recent heartbeat"; DV1's clock-skew-aware
+         liveness clock lives one layer up, in relay.py.
+
+    Every device id appears at most once, first-tier-wins (a device in
+    both the session override AND the global order keeps its SESSION
+    rank, never both)."""
+    seen: set = set()
+    result: List[str] = []
+    if session_id:
+        for device_id in get_session_priority(session_id):
+            if device_id not in seen:
+                seen.add(device_id)
+                result.append(device_id)
+    for device_id in get_global_priority():
+        if device_id not in seen:
+            seen.add(device_id)
+            result.append(device_id)
+    remaining = [d for d in list_devices(include_revoked=False) if d["id"] not in seen]
+    remaining.sort(key=lambda d: (d["last_seen"] is None, -(d["last_seen"] or 0)))
+    result.extend(d["id"] for d in remaining)
+    return result

@@ -33,7 +33,7 @@ from . import approvals, audit, cli, config, relay, skill_hooks, skill_links, st
 
 logger = logging.getLogger(__name__)
 
-__version__ = "0.1.0"
+__version__ = "0.2.4"
 
 
 def register(ctx) -> None:

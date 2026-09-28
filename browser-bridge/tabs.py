@@ -355,7 +355,7 @@ def close_opened_tabs(
 
 
 def handle_tabs(args: Dict[str, Any], **kwargs: Any) -> str:
-    device_id, err = tools_mod._resolve_device(args)
+    device_id, err = tools_mod._resolve_device(args, kwargs)
     if err:
         return err
     action = str(args.get("action") or "list").strip().lower()

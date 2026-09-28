@@ -1,4 +1,4 @@
-const PROTOCOL_VERSION = "1.3";
+const PROTOCOL_VERSION = "1.5";
 const HEARTBEAT_INTERVAL_MS = 2e4;
 const ERROR_CODES = {
   PARSE_ERROR: -32700,
@@ -121,8 +121,22 @@ const ERROR_CODES = {
   // speedimprovements.md G2: dom.snapshot/page.screenshot's `viewport` must have width in 320-3840 and height in 240-8000
   COMMIT_CONFIRM_REQUIRED: 4250,
   // speedimprovements.md H1: this is a committing action (Submit/Delete/etc) and this device is in Pause-for-confirmation mode; pass confirm: true and obtain user approval first
-  COMMIT_APPROVAL_DENIED: 4251
+  COMMIT_APPROVAL_DENIED: 4251,
   // speedimprovements.md H1: the user declined the approval prompt for this committing action
+  SILENT_ORIGIN_NOT_GRANTED: 4257,
+  // silentfetch.md SF3/SF4: this origin is not granted for background (silent.fetch) requests -- flip its 'Background requests' popup setting, or set silent_fetch.full_implies_silent, then retry
+  SILENT_WORKER_LAUNCH_FAILED: 4258,
+  // silentfetch.md SF1: the hidden worker tab for this origin could not be created or bootstrapped within its time budget
+  SILENT_WORKER_KILLED: 4259,
+  // silentfetch.md SF1.5: the worker tab servicing this request was killed (silent.kill or the global kill switch) before it completed
+  SILENT_RATE_LIMITED: 4260,
+  // silentfetch.md SF4.4: too many silent.fetch calls for this origin; back off and retry (2 req/s default, burst 10)
+  DEVICE_PRIORITY_PINNED: 4261,
+  // devices.md: the global device priority order is pinned; only the operator (CLI/popup) can change it -- the agent can read it but not reorder it until the user unpins it
+  DEVICE_NOT_ALIVE: 4262,
+  // devices.md: an explicit or tab/session-bound device target is stale past use or offline (or paused) -- see alive_devices for the alternatives
+  NO_ALIVE_DEVICE: 4263
+  // devices.md: no alive, unpaused device was available for an implicit (device-less) call -- see devices for each candidate's liveness
 };
 const REFUSALS = {
   "power_capability_disabled": { code: "GRANT_DENIED", params: ["capability", "settingNames"], message: "{capability} needs {settingNames} switched on for this device — open the extension's Options page, tick it under Powers, and press Save. Off is the shipped default: both the extension and the gateway refuse this independently before anything is dispatched, and a device that has never reported its settings is treated as having them all off." },

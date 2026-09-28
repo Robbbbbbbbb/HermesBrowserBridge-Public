@@ -1,7 +1,696 @@
 import { E as ERROR_CODES, f as formatRefusal } from "./chunks/refusals.js";
 import { a as attachabilityOf, d as describeAttachFailure, i as isForeignExtensionRefusal, f as foreignExtensionIds, p as preloadedPageHint, s as summariseFrameRefs, u as unreportedParentCount, r as redactText, g as getReplayStore, b as redactCaption, R as REDACT_THEN_TRUNCATE_PREFIX_MULTIPLIER, c as secretRedactionMarker, t as trimTrailingPartialToken, e as redactThenTruncate, h as redactSecrets } from "./chunks/replay-store.js";
-import { g as getSettings, s as setSettings, p as powerPolicyOf, r as redactionPolicyOf, c as clearCredentials, a as setCredentials, b as getCredentials } from "./chunks/storage.js";
+import { g as getSettings, s as setSettings, p as powerPolicyOf, r as redactionPolicyOf, a as getOriginSilentModes, c as clearCredentials, b as setCredentials, d as getCredentials } from "./chunks/storage.js";
 import { s as send } from "./chunks/messages.js";
+const SILENT_WORKER_LAUNCH_FAILED = ERROR_CODES.SILENT_WORKER_LAUNCH_FAILED;
+const SILENT_WORKER_KILLED = ERROR_CODES.SILENT_WORKER_KILLED;
+const POOL_WINDOW_TITLE = "Hermes Browser Bridge — background";
+const POOL_GROUP_TITLE = "Hermes background";
+const DEFAULT_MAX_WORKERS = 5;
+const DEFAULT_WORKER_TTL_MS = 30 * 60 * 1e3;
+const DEFAULT_BOOTSTRAP_TIMEOUT_MS = 3e4;
+const MIN_BOOTSTRAP_TIMEOUT_MS = 5e3;
+const MAX_BOOTSTRAP_TIMEOUT_MS = 12e4;
+let launchTimeoutMs = DEFAULT_BOOTSTRAP_TIMEOUT_MS;
+function clampBootstrapTimeoutMs(ms) {
+  return Math.min(MAX_BOOTSTRAP_TIMEOUT_MS, Math.max(MIN_BOOTSTRAP_TIMEOUT_MS, Math.floor(ms)));
+}
+class SilentPoolError extends Error {
+  code;
+  diagnostics;
+  constructor(code, message, diagnostics) {
+    super(message);
+    this.name = "SilentPoolError";
+    this.code = code;
+    this.diagnostics = diagnostics;
+  }
+}
+let poolWindowId;
+const workers = /* @__PURE__ */ new Map();
+const inFlightByOrigin = /* @__PURE__ */ new Map();
+let maxWorkers = DEFAULT_MAX_WORKERS;
+let workerTtlMs = DEFAULT_WORKER_TTL_MS;
+let adoptPromise;
+let loggedWindowRestored = false;
+let sweepAlarmRegistered = false;
+const SWEEP_ALARM = "silentPool.sweep";
+const SWEEP_PERIOD_MINUTES = 1;
+const SESSION_WINDOW_KEY = "silentPool.windowId";
+const SESSION_WORKERS_KEY = "silentPool.workers";
+function configurePool(opts) {
+  if (typeof opts.maxWorkers === "number" && Number.isFinite(opts.maxWorkers) && opts.maxWorkers > 0) {
+    maxWorkers = Math.floor(opts.maxWorkers);
+  }
+  if (typeof opts.workerTtlMs === "number" && Number.isFinite(opts.workerTtlMs) && opts.workerTtlMs > 0) {
+    workerTtlMs = Math.floor(opts.workerTtlMs);
+  }
+  if (typeof opts.bootstrapTimeoutMs === "number" && Number.isFinite(opts.bootstrapTimeoutMs) && opts.bootstrapTimeoutMs > 0) {
+    launchTimeoutMs = clampBootstrapTimeoutMs(opts.bootstrapTimeoutMs);
+  }
+}
+function notifySilentWorker(origin, action, opts = {}) {
+  if (typeof chrome === "undefined" || !chrome.runtime?.sendMessage) return;
+  try {
+    void chrome.runtime.sendMessage({
+      target: "offscreen",
+      type: "silent.worker",
+      origin,
+      action,
+      ...opts.reason ? { reason: opts.reason } : {},
+      ...opts.served !== void 0 ? { served: opts.served } : {},
+      ...opts.ageMs !== void 0 ? { ageMs: opts.ageMs } : {},
+      // Rev 3 §A diagnostics -- only present on launch_failed (every other
+      // action has nothing to report here); each is omitted rather than
+      // sent as null/undefined when this lifecycle point has none.
+      ...opts.failure ? { failure: opts.failure } : {},
+      ...opts.chromeError ? { chromeError: opts.chromeError } : {},
+      ...opts.lastUrl ? { lastUrl: opts.lastUrl } : {},
+      ...opts.redirects !== void 0 ? { redirects: opts.redirects } : {},
+      ...opts.redirectKinds ? { redirectKinds: opts.redirectKinds } : {},
+      ...opts.readyStateReached ? { readyStateReached: opts.readyStateReached } : {},
+      ...opts.elapsedMs !== void 0 ? { elapsedMs: opts.elapsedMs } : {}
+    }).catch(() => {
+    });
+  } catch {
+  }
+}
+function safeOrigin$3(url) {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return "";
+  }
+}
+async function persistState() {
+  try {
+    await chrome.storage.session.set({
+      [SESSION_WINDOW_KEY]: poolWindowId,
+      [SESSION_WORKERS_KEY]: [...workers.values()]
+    });
+  } catch {
+  }
+}
+function ensureAdopted() {
+  if (!adoptPromise) adoptPromise = doAdopt();
+  return adoptPromise;
+}
+async function doAdopt() {
+  let stored;
+  try {
+    stored = await chrome.storage.session.get([SESSION_WINDOW_KEY, SESSION_WORKERS_KEY]);
+  } catch {
+    return;
+  }
+  const storedWindowId = stored[SESSION_WINDOW_KEY];
+  if (typeof storedWindowId === "number") {
+    try {
+      await chrome.windows.get(storedWindowId);
+      poolWindowId = storedWindowId;
+    } catch {
+      poolWindowId = void 0;
+    }
+  }
+  const storedWorkers = stored[SESSION_WORKERS_KEY];
+  if (poolWindowId !== void 0 && Array.isArray(storedWorkers)) {
+    for (const raw of storedWorkers) {
+      if (!raw || typeof raw.tabId !== "number" || typeof raw.origin !== "string") continue;
+      try {
+        const tab = await chrome.tabs.get(raw.tabId);
+        if (tab.windowId !== poolWindowId) continue;
+        const createdAt = typeof raw.createdAt === "number" ? raw.createdAt : Date.now();
+        const served = typeof raw.served === "number" ? raw.served : 0;
+        workers.set(raw.origin, {
+          origin: raw.origin,
+          tabId: raw.tabId,
+          windowId: poolWindowId,
+          createdAt,
+          lastUsed: typeof raw.lastUsed === "number" ? raw.lastUsed : Date.now(),
+          served,
+          state: "idle"
+          // any in-flight fetch died with the old worker instance
+        });
+        notifySilentWorker(raw.origin, "adopted", {
+          reason: "sw_restart",
+          served,
+          ageMs: Math.max(0, Date.now() - createdAt)
+        });
+      } catch {
+      }
+    }
+  }
+  registerSweepAlarm();
+  await persistState();
+}
+function registerSweepAlarm() {
+  if (sweepAlarmRegistered) return;
+  sweepAlarmRegistered = true;
+  try {
+    void chrome.alarms.create(SWEEP_ALARM, { periodInMinutes: SWEEP_PERIOD_MINUTES });
+  } catch {
+  }
+}
+if (typeof chrome !== "undefined" && chrome.alarms?.onAlarm?.addListener) {
+  chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name === SWEEP_ALARM) void sweepExpiredWorkers();
+  });
+}
+async function sweepExpiredWorkers(now = Date.now) {
+  await ensureAdopted();
+  const cutoff = now() - workerTtlMs;
+  for (const worker of [...workers.values()]) {
+    if (worker.state !== "idle") continue;
+    const reason = await driftReason(worker);
+    if (reason) {
+      await recycleWorker(worker.origin, "recycle", reason, now);
+      continue;
+    }
+    if (worker.lastUsed < cutoff) {
+      await recycleWorker(worker.origin, "recycle", "ttl", now);
+    }
+  }
+}
+const OLD_POOL_WINDOW_URL_PREFIX = "data:text/html,";
+function poolWindowUrl() {
+  if (typeof chrome !== "undefined" && chrome.runtime?.getURL) {
+    try {
+      return chrome.runtime.getURL("pool.html");
+    } catch {
+    }
+  }
+  return `${OLD_POOL_WINDOW_URL_PREFIX}<title>${encodeURIComponent(POOL_WINDOW_TITLE)}</title>`;
+}
+async function createPoolWindow() {
+  const win = await chrome.windows.create({ url: poolWindowUrl(), state: "minimized", focused: false, type: "normal" });
+  const windowId = win.id;
+  if (typeof windowId !== "number") {
+    throw new SilentPoolError(SILENT_WORKER_LAUNCH_FAILED, "chrome.windows.create returned no window id");
+  }
+  poolWindowId = windowId;
+  await persistState();
+  return windowId;
+}
+async function ensurePoolWindow() {
+  if (typeof poolWindowId === "number") {
+    try {
+      await chrome.windows.get(poolWindowId);
+      return poolWindowId;
+    } catch {
+      poolWindowId = void 0;
+    }
+  }
+  return createPoolWindow();
+}
+let groupLock = Promise.resolve();
+async function withGroupLock(fn) {
+  const prior = groupLock;
+  let release = () => {
+  };
+  groupLock = new Promise((resolve) => release = resolve);
+  await prior;
+  try {
+    return await fn();
+  } finally {
+    release();
+  }
+}
+async function addToPoolGroup(windowId, tabId) {
+  await withGroupLock(async () => {
+    await groupInWindow(windowId, tabId);
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.windowId === windowId) return;
+    await chrome.tabs.move(tabId, { windowId, index: -1 });
+    await groupInWindow(windowId, tabId);
+  });
+}
+async function groupInWindow(windowId, tabId) {
+  const existing = chrome.tabGroups ? await chrome.tabGroups.query({ windowId, title: POOL_GROUP_TITLE }) : [];
+  const existingId = existing[0]?.id;
+  if (typeof existingId === "number") {
+    await chrome.tabs.group({ tabIds: [tabId], groupId: existingId });
+    return;
+  }
+  const groupId = await chrome.tabs.group({ tabIds: [tabId], createProperties: { windowId } });
+  if (chrome.tabGroups) {
+    await chrome.tabGroups.update(groupId, { title: POOL_GROUP_TITLE, collapsed: true });
+  }
+}
+if (typeof chrome !== "undefined" && chrome.windows?.onFocusChanged?.addListener) {
+  chrome.windows.onFocusChanged.addListener((windowId) => {
+    if (windowId !== poolWindowId || loggedWindowRestored) return;
+    loggedWindowRestored = true;
+    console.info("[hermes] pool_window_restored: the background worker window was focused by the user");
+  });
+}
+function bootstrapRedirectMessage(foreignOrigin, targetOrigin) {
+  const landedOn = foreignOrigin || "an unknown origin";
+  return `bootstrap redirected to ${landedOn}; fetch that origin, or pass bootstrap_path to a page that stays on ${targetOrigin}`;
+}
+const FOREIGN_SETTLE_GRACE_MS = 1500;
+function lastUrlFrom(url) {
+  try {
+    const parsed = new URL(url);
+    const value = `${parsed.origin}${parsed.pathname}`;
+    return value.length > 128 ? value.slice(0, 128) : value;
+  } catch {
+    return void 0;
+  }
+}
+function sanitizeChromeError(raw) {
+  return raw && /^net::[A-Z_]+$/.test(raw) ? raw : void 0;
+}
+function isRealOrigin(origin) {
+  return origin !== "" && origin !== "null";
+}
+function diagnosticSummary(diag) {
+  const parts = [`reached=${diag.readyStateReached ?? "none"}`];
+  if (diag.lastUrl) parts.push(`last_url=${diag.lastUrl}`);
+  if (diag.redirects) parts.push(`redirects=${diag.redirects}`);
+  if (diag.chromeError) parts.push(`chrome_error=${diag.chromeError}`);
+  parts.push(`elapsed_ms=${diag.elapsedMs ?? 0}`);
+  return parts.join(" ");
+}
+async function probeReadyState(tabId) {
+  if (typeof chrome === "undefined" || !chrome.scripting?.executeScript) return void 0;
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: () => document.readyState
+    });
+    const state = results[0]?.result;
+    return state === "interactive" || state === "complete" ? state : void 0;
+  } catch {
+    return void 0;
+  }
+}
+function waitForTopFrameLoad(tabId, timeoutMs, targetOrigin) {
+  return new Promise((resolve, reject) => {
+    const startedAt = Date.now();
+    let settled = false;
+    let timer;
+    let graceTimer;
+    let readyStateReached = "none";
+    let lastUrl;
+    let chromeError;
+    let redirects = 0;
+    const redirectKinds = { server_redirect: 0, client_redirect: 0 };
+    let committedOrigin;
+    let sawFirstCommit = false;
+    const snapshot = () => ({
+      chromeError,
+      lastUrl,
+      redirects,
+      redirectKinds: { ...redirectKinds },
+      readyStateReached,
+      elapsedMs: Date.now() - startedAt
+    });
+    const clearGrace = () => {
+      if (graceTimer) {
+        clearTimeout(graceTimer);
+        graceTimer = void 0;
+      }
+    };
+    const finish = (act) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearGrace();
+      chrome.webNavigation.onCommitted?.removeListener(onCommitted);
+      chrome.webNavigation.onDOMContentLoaded?.removeListener(onDomContentLoaded);
+      chrome.webNavigation.onCompleted.removeListener(onCompleted);
+      chrome.webNavigation.onErrorOccurred?.removeListener(onErrorOccurred);
+      act();
+    };
+    const resolveReady = () => finish(() => resolve());
+    const failNavError = () => {
+      const diag = snapshot();
+      finish(
+        () => reject(
+          new SilentPoolError(
+            SILENT_WORKER_LAUNCH_FAILED,
+            `worker navigation failed${chromeError ? `: ${chromeError}` : ""} (${diagnosticSummary(diag)})`,
+            { ...diag, failure: "nav_error" }
+          )
+        )
+      );
+    };
+    const failForeign = () => {
+      const diag = snapshot();
+      const message = `${bootstrapRedirectMessage(committedOrigin ?? "", targetOrigin)} (${diagnosticSummary(diag)})`;
+      finish(() => reject(new SilentPoolError(SILENT_WORKER_LAUNCH_FAILED, message, { ...diag, failure: "redirect_foreign" })));
+    };
+    const armForeignGrace = () => {
+      clearGrace();
+      graceTimer = setTimeout(() => {
+        if (!settled) failForeign();
+      }, FOREIGN_SETTLE_GRACE_MS);
+    };
+    const armAbortGrace = () => {
+      clearGrace();
+      graceTimer = setTimeout(() => {
+        if (!settled) failNavError();
+      }, FOREIGN_SETTLE_GRACE_MS);
+    };
+    const onCommitted = (details) => {
+      if (settled || details.tabId !== tabId || details.frameId !== 0) return;
+      const origin = safeOrigin$3(details.url ?? "");
+      if (!isRealOrigin(origin)) return;
+      clearGrace();
+      if (readyStateReached === "none") readyStateReached = "committed";
+      const url = lastUrlFrom(details.url ?? "");
+      if (url) lastUrl = url;
+      if (sawFirstCommit) {
+        redirects += 1;
+        const qualifiers = details.transitionQualifiers || [];
+        if (qualifiers.includes("server_redirect")) redirectKinds.server_redirect += 1;
+        if (qualifiers.includes("client_redirect")) redirectKinds.client_redirect += 1;
+      }
+      sawFirstCommit = true;
+      committedOrigin = origin;
+    };
+    const onDomContentLoaded = (details) => {
+      if (settled || details.tabId !== tabId || details.frameId !== 0) return;
+      const origin = safeOrigin$3(details.url ?? "");
+      if (!isRealOrigin(origin)) return;
+      if (readyStateReached === "none" || readyStateReached === "committed") readyStateReached = "interactive";
+      const url = lastUrlFrom(details.url ?? "");
+      if (url) lastUrl = url;
+      committedOrigin = origin;
+      if (origin === targetOrigin) {
+        resolveReady();
+        return;
+      }
+      armForeignGrace();
+    };
+    const onCompleted = (details) => {
+      if (settled || details.tabId !== tabId || details.frameId !== 0) return;
+      const origin = safeOrigin$3(details.url ?? "");
+      if (!isRealOrigin(origin)) return;
+      readyStateReached = "complete";
+      const url = lastUrlFrom(details.url ?? "");
+      if (url) lastUrl = url;
+      committedOrigin = origin;
+      if (origin === targetOrigin) {
+        resolveReady();
+        return;
+      }
+      if (!graceTimer) armForeignGrace();
+    };
+    const onErrorOccurred = (details) => {
+      if (settled || details.tabId !== tabId || details.frameId !== 0) return;
+      const sanitized = sanitizeChromeError(details.error);
+      if (sanitized) chromeError = sanitized;
+      armAbortGrace();
+    };
+    void (async () => {
+      if (settled) return;
+      let tab;
+      try {
+        tab = await chrome.tabs.get(tabId);
+      } catch {
+        return;
+      }
+      if (settled) return;
+      const origin = safeOrigin$3(tab.url ?? "");
+      if (!isRealOrigin(origin)) return;
+      const url = lastUrlFrom(tab.url ?? "");
+      if (url) lastUrl = url;
+      committedOrigin = origin;
+      if (readyStateReached === "none") readyStateReached = "committed";
+      if (tab.status === "complete") {
+        readyStateReached = "complete";
+        if (origin === targetOrigin) {
+          resolveReady();
+          return;
+        }
+        armForeignGrace();
+        return;
+      }
+      if (origin === targetOrigin) {
+        const probed = await probeReadyState(tabId);
+        if (settled) return;
+        if (probed) {
+          readyStateReached = probed;
+          resolveReady();
+        }
+      }
+    })();
+    timer = setTimeout(() => {
+      if (settled) return;
+      const diag = snapshot();
+      finish(
+        () => reject(
+          new SilentPoolError(
+            SILENT_WORKER_LAUNCH_FAILED,
+            `worker did not finish loading within ${timeoutMs}ms (${diagnosticSummary(diag)})`,
+            { ...diag, failure: "timeout" }
+          )
+        )
+      );
+    }, timeoutMs);
+    chrome.webNavigation.onCommitted?.addListener(onCommitted);
+    chrome.webNavigation.onDOMContentLoaded?.addListener(onDomContentLoaded);
+    chrome.webNavigation.onCompleted.addListener(onCompleted);
+    chrome.webNavigation.onErrorOccurred?.addListener(onErrorOccurred);
+  });
+}
+async function launchWorker(origin, bootstrapPath, bootstrapTimeoutMsOverride, now) {
+  const launchStartedAt = now();
+  const effectiveTimeoutMs = typeof bootstrapTimeoutMsOverride === "number" && Number.isFinite(bootstrapTimeoutMsOverride) && bootstrapTimeoutMsOverride > 0 ? clampBootstrapTimeoutMs(bootstrapTimeoutMsOverride) : launchTimeoutMs;
+  const windowId = await ensurePoolWindow();
+  const target = `${origin}${bootstrapPath || "/"}`;
+  let tabId;
+  try {
+    const tab = await chrome.tabs.create({ windowId, url: target, active: false });
+    if (typeof tab.id !== "number") throw new Error("chrome.tabs.create returned no tab id");
+    tabId = tab.id;
+  } catch (error) {
+    const elapsedMs = Math.max(0, now() - launchStartedAt);
+    notifySilentWorker(origin, "launch_failed", { failure: "create_failed", readyStateReached: "none", elapsedMs });
+    throw new SilentPoolError(SILENT_WORKER_LAUNCH_FAILED, `could not create worker tab: ${describeError$1(error)}`, {
+      failure: "create_failed",
+      readyStateReached: "none",
+      elapsedMs
+    });
+  }
+  const loaded = waitForTopFrameLoad(tabId, effectiveTimeoutMs, origin);
+  try {
+    await addToPoolGroup(windowId, tabId);
+  } catch (error) {
+    await closeTabQuietly(tabId);
+    const elapsedMs = Math.max(0, now() - launchStartedAt);
+    notifySilentWorker(origin, "launch_failed", { failure: "group_failed", readyStateReached: "none", elapsedMs });
+    throw new SilentPoolError(SILENT_WORKER_LAUNCH_FAILED, `could not group worker tab: ${describeError$1(error)}`, {
+      failure: "group_failed",
+      readyStateReached: "none",
+      elapsedMs
+    });
+  }
+  try {
+    await loaded;
+  } catch (error) {
+    await closeTabQuietly(tabId);
+    const diag = error instanceof SilentPoolError ? error.diagnostics : void 0;
+    notifySilentWorker(origin, "launch_failed", {
+      reason: "nav_error",
+      failure: diag?.failure ?? "nav_error",
+      chromeError: diag?.chromeError,
+      lastUrl: diag?.lastUrl,
+      redirects: diag?.redirects,
+      redirectKinds: diag?.redirectKinds,
+      readyStateReached: diag?.readyStateReached,
+      elapsedMs: diag?.elapsedMs ?? Math.max(0, now() - launchStartedAt)
+    });
+    if (error instanceof SilentPoolError) throw error;
+    throw new SilentPoolError(SILENT_WORKER_LAUNCH_FAILED, `worker navigation failed: ${describeError$1(error)}`, {
+      failure: "nav_error",
+      elapsedMs: Math.max(0, now() - launchStartedAt)
+    });
+  }
+  const createdAt = now();
+  notifySilentWorker(origin, "launch");
+  return { origin, tabId, windowId, createdAt, lastUsed: createdAt, served: 0, state: "idle" };
+}
+async function closeTabQuietly(tabId) {
+  try {
+    await chrome.tabs.remove(tabId);
+  } catch {
+  }
+}
+function describeError$1(error) {
+  if (error instanceof Error) return error.message;
+  return String(error);
+}
+function rejectInFlight(origin, code) {
+  const set = inFlightByOrigin.get(origin);
+  if (!set) return;
+  for (const abort of set) {
+    try {
+      abort(code);
+    } catch {
+    }
+  }
+  inFlightByOrigin.delete(origin);
+}
+async function recycleWorker(origin, action, reason, now = Date.now) {
+  const worker = workers.get(origin);
+  if (!worker) return;
+  workers.delete(origin);
+  rejectInFlight(origin, SILENT_WORKER_KILLED);
+  notifySilentWorker(origin, action, { reason, served: worker.served, ageMs: Math.max(0, now() - worker.createdAt) });
+  await closeTabQuietly(worker.tabId);
+  await persistState();
+}
+function pickLruIdleWorker() {
+  let lru;
+  for (const worker of workers.values()) {
+    if (worker.state !== "idle") continue;
+    if (!lru || worker.lastUsed < lru.lastUsed) lru = worker;
+  }
+  return lru;
+}
+async function driftReason(worker) {
+  let tab;
+  try {
+    tab = await chrome.tabs.get(worker.tabId);
+  } catch {
+    return "origin_drift";
+  }
+  if (tab.windowId !== worker.windowId) return "window_drift";
+  if (safeOrigin$3(tab.url ?? "") !== worker.origin) return "origin_drift";
+  return void 0;
+}
+async function acquireWorker(origin, opts = {}, now = Date.now) {
+  await ensureAdopted();
+  let worker = workers.get(origin);
+  if (worker) {
+    const reason = await driftReason(worker);
+    if (reason) {
+      await recycleWorker(origin, "recycle", reason, now);
+      worker = void 0;
+    }
+  }
+  if (!worker) {
+    if (workers.size >= maxWorkers && !workers.has(origin)) {
+      const lru = pickLruIdleWorker();
+      if (lru) await recycleWorker(lru.origin, "evict", "lru", now);
+    }
+    worker = await launchWorker(origin, opts.bootstrapPath, opts.bootstrapTimeoutMs, now);
+    workers.set(origin, worker);
+    await persistState();
+  }
+  worker.state = "busy";
+  worker.lastUsed = now();
+  await persistState();
+  let released = false;
+  const tabId = worker.tabId;
+  return {
+    tabId,
+    origin,
+    release: () => {
+      if (released) return;
+      released = true;
+      const current = workers.get(origin);
+      if (current && current.tabId === tabId) {
+        current.state = "idle";
+        current.served += 1;
+        current.lastUsed = now();
+        void persistState();
+      }
+    }
+  };
+}
+function registerInFlight(origin, abort) {
+  let set = inFlightByOrigin.get(origin);
+  if (!set) inFlightByOrigin.set(origin, set = /* @__PURE__ */ new Set());
+  set.add(abort);
+  return () => {
+    const current = inFlightByOrigin.get(origin);
+    if (!current) return;
+    current.delete(abort);
+    if (current.size === 0) inFlightByOrigin.delete(origin);
+  };
+}
+async function killWorkers(origin, reason = "user_kill") {
+  await ensureAdopted();
+  const targets = origin ? workers.has(origin) ? [origin] : [] : [...workers.keys()];
+  for (const target of targets) {
+    await recycleWorker(target, "kill", reason);
+  }
+  return { killed: targets.length };
+}
+async function killPool() {
+  const result = await killWorkers(void 0, "kill_switch");
+  if (typeof poolWindowId === "number") {
+    try {
+      await chrome.windows.remove(poolWindowId);
+    } catch {
+    }
+    poolWindowId = void 0;
+    await persistState();
+  }
+  return result;
+}
+async function listWorkers(now = Date.now) {
+  await ensureAdopted();
+  return [...workers.values()].map((w) => ({
+    origin: w.origin,
+    tabId: w.tabId,
+    ageMs: now() - w.createdAt,
+    idleMs: now() - w.lastUsed,
+    served: w.served,
+    state: w.state
+  }));
+}
+function isPoolTab(tabId) {
+  for (const worker of workers.values()) {
+    if (worker.tabId === tabId) return true;
+  }
+  return false;
+}
+function isPoolWindow(windowId) {
+  return windowId === poolWindowId;
+}
+async function getPoolWindowId() {
+  await ensureAdopted();
+  return poolWindowId;
+}
+function warmPoolAdoption() {
+  void ensureAdopted();
+}
+if (typeof chrome !== "undefined" && chrome.tabs?.onRemoved?.addListener) {
+  chrome.tabs.onRemoved.addListener((tabId) => {
+    for (const [origin, worker] of workers) {
+      if (worker.tabId !== tabId) continue;
+      workers.delete(origin);
+      rejectInFlight(origin, SILENT_WORKER_KILLED);
+      notifySilentWorker(origin, "closed", {
+        reason: "user_closed",
+        served: worker.served,
+        ageMs: Math.max(0, Date.now() - worker.createdAt)
+      });
+      void persistState();
+      break;
+    }
+  });
+}
+if (typeof chrome !== "undefined" && chrome.windows?.onRemoved?.addListener) {
+  chrome.windows.onRemoved.addListener((windowId) => {
+    if (windowId !== poolWindowId) return;
+    poolWindowId = void 0;
+    for (const [origin, worker] of workers) {
+      rejectInFlight(origin, SILENT_WORKER_KILLED);
+      notifySilentWorker(origin, "closed", {
+        reason: "user_closed",
+        served: worker.served,
+        ageMs: Math.max(0, Date.now() - worker.createdAt)
+      });
+    }
+    workers.clear();
+    loggedWindowRestored = false;
+    void persistState();
+  });
+}
 const SHARED_GROUP_TITLE = "Shared with Hermes";
 const SHARED_GROUP_COLOR = "purple";
 const SHARED_BADGE_COLOR = "#0891b2";
@@ -112,7 +801,7 @@ async function pausedNow() {
     return false;
   }
 }
-const PROTOCOL_VERSION = "1.3";
+const CDP_PROTOCOL_VERSION = "1.3";
 const DESIRED_ATTACH_KEY = "cdp.desiredAttach";
 const LIMITED_ATTACH_KEY = "cdp.limitedAttach";
 const UPGRADE_RETRY_INTERVAL_MS = 5e3;
@@ -272,7 +961,7 @@ async function attemptStripAndAttach(tabId, frames) {
   let attached = false;
   let allRestored = true;
   try {
-    await chrome.debugger.attach({ tabId }, PROTOCOL_VERSION);
+    await chrome.debugger.attach({ tabId }, CDP_PROTOCOL_VERSION);
     attached = true;
   } catch {
     attached = false;
@@ -689,6 +1378,12 @@ class CdpManager {
    */
   async attach(tabId, reloadIfBlocked = false) {
     if (this.attached.has(tabId)) return { ok: true, result: { tabId, mode: "full" } };
+    if (isPoolTab(tabId)) {
+      return {
+        ok: false,
+        error: { code: ERROR_CODES.CDP_ERROR, message: "this tab is a Hermes background worker and cannot be attached" }
+      };
+    }
     let url;
     try {
       url = (await chrome.tabs.get(tabId)).url;
@@ -708,7 +1403,7 @@ class CdpManager {
     for (let attempt = 1; attempt <= MAX_FOREIGN_FRAME_ATTACH_ATTEMPTS; attempt++) {
       attemptsUsed = attempt;
       try {
-        await chrome.debugger.attach({ tabId }, PROTOCOL_VERSION);
+        await chrome.debugger.attach({ tabId }, CDP_PROTOCOL_VERSION);
         attached = true;
         break;
       } catch (error) {
@@ -2572,7 +3267,7 @@ async function recordReplayFrame(ctx, outcome) {
   } catch {
   }
 }
-const DEFAULT_TIMEOUT_MS$2 = 1e4;
+const DEFAULT_TIMEOUT_MS$3 = 1e4;
 const HOVER_DEFAULT_MS = 250;
 const HOVER_MAX_MS = 5e3;
 const DIFF_SNAPSHOT_BUDGET_BYTES = 8192;
@@ -4656,7 +5351,7 @@ async function handlePageAct(msg) {
   if (!frames.ok) return frames.result;
   if (msg.classifyOnly === true) return classifyActTarget(msg, frames.sourceFrame);
   clearDialogBuffer(msg.tabId);
-  const timeoutMs = msg.timeoutMs ?? DEFAULT_TIMEOUT_MS$2;
+  const timeoutMs = msg.timeoutMs ?? DEFAULT_TIMEOUT_MS$3;
   let op;
   const cancelHandle = registerCancellable(msg.tabId, `act:${msg.action}`, () => {
     void contentRequest(msg.tabId, { target: "content", type: "settleQuiet.cancel" }).catch(() => {
@@ -4846,8 +5541,8 @@ async function withViewportOverride(tabId, viewport, settleAfter, body) {
     }
   });
 }
-const DEFAULT_TIMEOUT_MS$1 = 3e4;
-const DEFAULT_MAX_BYTES = 2 * 1024 * 1024;
+const DEFAULT_TIMEOUT_MS$2 = 3e4;
+const DEFAULT_MAX_BYTES$1 = 2 * 1024 * 1024;
 async function pageFetchImpl(args) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), args.timeoutMs);
@@ -4924,10 +5619,10 @@ async function pageFetchImpl(args) {
     clearTimeout(timer);
   }
 }
-function isFailure(value) {
+function isFailure$1(value) {
   return Boolean(value) && value.__hermesFetchError === true;
 }
-function validateUrl(url) {
+function validateUrl$1(url) {
   let parsed;
   try {
     parsed = new URL(url);
@@ -4946,7 +5641,7 @@ async function handlePageFetch(msg) {
   if (!msg.url) {
     return { ok: false, code: ERROR_CODES.INVALID_PARAMS, error: "page.fetch requires a url" };
   }
-  const urlError = validateUrl(msg.url);
+  const urlError = validateUrl$1(msg.url);
   if (urlError) {
     return { ok: false, code: ERROR_CODES.INVALID_PARAMS, error: urlError };
   }
@@ -4956,8 +5651,8 @@ async function handlePageFetch(msg) {
     headers: msg.headers ?? {},
     body: msg.body ?? null,
     credentials: msg.credentials ?? "include",
-    timeoutMs: msg.timeoutMs ?? DEFAULT_TIMEOUT_MS$1,
-    maxBytes: msg.maxBytes ?? DEFAULT_MAX_BYTES
+    timeoutMs: msg.timeoutMs ?? DEFAULT_TIMEOUT_MS$2,
+    maxBytes: msg.maxBytes ?? DEFAULT_MAX_BYTES$1
   };
   const expression = `(${pageFetchImpl.toString()})(${JSON.stringify(args)})`;
   const sent = await cdp.send(msg.tabId, "Runtime.evaluate", {
@@ -4973,7 +5668,7 @@ async function handlePageFetch(msg) {
     return { ok: false, code: ERROR_CODES.CDP_ERROR, error: detail };
   }
   const value = sent.result.result?.value;
-  if (isFailure(value)) {
+  if (isFailure$1(value)) {
     const code = value.kind === "timeout" ? ERROR_CODES.TIMEOUT : ERROR_CODES.CDP_ERROR;
     return { ok: false, code, error: value.message };
   }
@@ -4989,6 +5684,622 @@ async function handlePageFetch(msg) {
       bodyEncoding: value.bodyEncoding,
       truncated: value.truncated
     }
+  };
+}
+const DEFAULT_TIMEOUT_MS$1 = 3e4;
+const DEFAULT_MAX_BYTES = 2 * 1024 * 1024;
+const HARD_CAP_BYTES = 16 * 1024 * 1024;
+let effectiveMaxBodyBytes = HARD_CAP_BYTES;
+function configureBodyCap(maxBodyBytes) {
+  if (typeof maxBodyBytes === "number" && Number.isFinite(maxBodyBytes) && maxBodyBytes > 0) {
+    effectiveMaxBodyBytes = Math.floor(maxBodyBytes);
+  }
+}
+const SLICE_BYTES = 1 * 1024 * 1024;
+const BUFFER_TTL_MS = 2 * 60 * 1e3;
+const WORKER_READY_RETRY_WAIT_MS = 5e3;
+const WORKER_READY_POLL_INTERVAL_MS = 100;
+async function pageSilentFetchImpl(args) {
+  const startedAt = Date.now();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), args.timeoutMs);
+  const metaKey = `${args.bufferKey}_meta`;
+  const ctrlKey = `${args.bufferKey}_ctrl`;
+  const glob = globalThis;
+  try {
+    Object.defineProperty(glob, ctrlKey, { value: controller, enumerable: false, configurable: true, writable: false });
+  } catch {
+  }
+  const progress = {
+    phase: "page_fetch_headers",
+    phaseStartedAt: startedAt,
+    bytesSoFar: 0,
+    fetchNative: false,
+    fetchImplUsed: "page"
+  };
+  try {
+    Object.defineProperty(glob, metaKey, { value: progress, enumerable: false, configurable: true, writable: false });
+  } catch {
+  }
+  let fetchFn = fetch;
+  let nativeIframe;
+  if (args.fetchImpl === "native") {
+    try {
+      nativeIframe = document.createElement("iframe");
+      nativeIframe.style.display = "none";
+      nativeIframe.setAttribute("aria-hidden", "true");
+      nativeIframe.src = "about:blank";
+      (document.documentElement || document.body).appendChild(nativeIframe);
+      const win = nativeIframe.contentWindow;
+      if (win && typeof win.fetch === "function") {
+        fetchFn = win.fetch.bind(win);
+        progress.fetchImplUsed = "native";
+      }
+    } catch {
+    }
+  }
+  progress.fetchNative = fetchFn.toString().includes("[native code]");
+  try {
+    let toBase64 = function(bytes) {
+      let binary = "";
+      for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i]);
+      return btoa(binary);
+    };
+    const response = await fetchFn(args.url, {
+      method: args.method,
+      headers: args.headers,
+      body: args.body === null ? void 0 : args.body,
+      credentials: args.credentials,
+      mode: "cors",
+      cache: "no-store",
+      redirect: "follow",
+      signal: controller.signal
+    });
+    const ttfbMs = Date.now() - startedAt;
+    progress.phase = "draining";
+    progress.phaseStartedAt = Date.now();
+    const headers = {};
+    response.headers.forEach((value, key) => {
+      headers[key] = value;
+    });
+    let setCookieNames = [];
+    let setCookieCount = 0;
+    try {
+      const withGetSetCookie = response.headers;
+      if (typeof withGetSetCookie.getSetCookie === "function") {
+        const raw = withGetSetCookie.getSetCookie();
+        setCookieCount = raw.length;
+        setCookieNames = raw.map((line) => (line.split("=")[0] ?? "").trim()).filter((name) => name.length > 0);
+      }
+    } catch {
+    }
+    const contentLengthHeader = headers["content-length"];
+    const contentLength = contentLengthHeader ? Number(contentLengthHeader) : NaN;
+    const kept = [];
+    let keptLength = 0;
+    let counted = 0;
+    let timedOutMidDrain = false;
+    const reader = response.body ? response.body.getReader() : null;
+    if (reader) {
+      for (; ; ) {
+        let step;
+        try {
+          step = await reader.read();
+        } catch (readError) {
+          if (readError?.name === "AbortError") {
+            timedOutMidDrain = true;
+            break;
+          }
+          throw readError;
+        }
+        if (step.done) break;
+        const value = step.value;
+        if (!value || value.length === 0) continue;
+        counted += value.length;
+        progress.bytesSoFar = counted;
+        const remaining = args.maxBytes - keptLength;
+        if (remaining > 0) {
+          const slice = value.length > remaining ? value.subarray(0, remaining) : value;
+          kept.push(slice);
+          keptLength += slice.length;
+        }
+      }
+    }
+    clearTimeout(timer);
+    const capturedBytes = new Uint8Array(keptLength);
+    let offset = 0;
+    for (const chunk of kept) {
+      capturedBytes.set(chunk, offset);
+      offset += chunk.length;
+    }
+    const wireTruncated = timedOutMidDrain || counted > keptLength;
+    let totalBytes;
+    let totalBytesSource;
+    if (timedOutMidDrain) {
+      if (Number.isFinite(contentLength) && contentLength >= 0) {
+        totalBytes = contentLength;
+        totalBytesSource = "content-length";
+      } else {
+        totalBytes = counted;
+        totalBytesSource = "partial";
+      }
+    } else {
+      totalBytes = counted;
+      totalBytesSource = "stream";
+    }
+    const digest = await crypto.subtle.digest("SHA-256", capturedBytes);
+    const sha256 = Array.from(new Uint8Array(digest)).map((byte) => byte.toString(16).padStart(2, "0")).join("");
+    const contentType = (headers["content-type"] ?? "").toLowerCase();
+    const looksTextualByType = contentType === "" || /^text\//.test(contentType) || /(json|xml|javascript|ecmascript|x-www-form-urlencoded|svg)/.test(contentType);
+    const wantsText = args.expect === "text" || args.expect === "json" || args.expect === "auto" && looksTextualByType;
+    let bodyText = null;
+    if (wantsText) {
+      try {
+        const decoded = new TextDecoder("utf-8", { fatal: true }).decode(capturedBytes);
+        if (args.expect === "json") JSON.parse(decoded);
+        bodyText = decoded;
+      } catch {
+        bodyText = null;
+      }
+    }
+    let inlineBody;
+    let bufferedLength;
+    let bodyEncoding;
+    if (capturedBytes.length <= args.inlineThreshold) {
+      if (bodyText !== null) {
+        inlineBody = bodyText;
+        bodyEncoding = "utf-8";
+      } else {
+        inlineBody = toBase64(capturedBytes);
+        bodyEncoding = "base64";
+      }
+    } else {
+      bodyEncoding = "base64";
+      bufferedLength = capturedBytes.length;
+      try {
+        Object.defineProperty(globalThis, args.bufferKey, {
+          value: { bytes: capturedBytes },
+          enumerable: false,
+          configurable: true,
+          writable: false
+        });
+        const ttlTimer = setTimeout(() => {
+          try {
+            delete globalThis[args.bufferKey];
+          } catch {
+          }
+        }, args.bufferTtlMs);
+        ttlTimer?.unref?.();
+      } catch {
+      }
+    }
+    progress.phase = "done";
+    return {
+      status: response.status,
+      headers,
+      setCookieNames,
+      setCookieCount,
+      contentType: headers["content-type"] ?? "",
+      totalBytes,
+      totalBytesSource,
+      wireTruncated,
+      sha256,
+      ttfbMs,
+      bodyEncoding,
+      inlineBody,
+      bufferedLength,
+      fetchNative: progress.fetchNative,
+      fetchImplUsed: progress.fetchImplUsed
+    };
+  } catch (error) {
+    clearTimeout(timer);
+    const err = error;
+    return {
+      __hermesSilentFetchError: true,
+      kind: err?.name === "AbortError" ? "timeout" : "network",
+      message: err?.message ?? "silent.fetch failed",
+      fetchNative: progress.fetchNative,
+      fetchImplUsed: progress.fetchImplUsed
+    };
+  } finally {
+    if (nativeIframe) {
+      try {
+        nativeIframe.remove();
+      } catch {
+      }
+    }
+    try {
+      delete glob[ctrlKey];
+    } catch {
+    }
+    try {
+      delete glob[metaKey];
+    } catch {
+    }
+  }
+}
+function pageSilentFetchSliceImpl(args) {
+  const bucket = globalThis[args.bufferKey];
+  if (!bucket) {
+    return { dataB64: "", last: true, missing: true };
+  }
+  const start = args.index * args.sliceBytes;
+  const end = Math.min(start + args.sliceBytes, bucket.bytes.length);
+  const slice = bucket.bytes.subarray(start, end);
+  let binary = "";
+  for (let i = 0; i < slice.length; i += 1) binary += String.fromCharCode(slice[i]);
+  const last = end >= bucket.bytes.length;
+  if (last) {
+    try {
+      delete globalThis[args.bufferKey];
+    } catch {
+    }
+  }
+  return { dataB64: btoa(binary), last };
+}
+function pageSilentFetchAbortImpl(args) {
+  const glob = globalThis;
+  let aborted = false;
+  try {
+    const ctrl = glob[`${args.bufferKey}_ctrl`];
+    if (ctrl && typeof ctrl.abort === "function") {
+      ctrl.abort();
+      aborted = true;
+    }
+  } catch {
+  }
+  try {
+    delete glob[args.bufferKey];
+  } catch {
+  }
+  return { aborted };
+}
+function pageSilentFetchProgressImpl(args) {
+  const glob = globalThis;
+  const meta = glob[`${args.bufferKey}_meta`];
+  if (!meta) return void 0;
+  return {
+    phase: meta.phase,
+    phaseStartedAt: meta.phaseStartedAt,
+    bytesSoFar: meta.bytesSoFar,
+    fetchNative: meta.fetchNative,
+    fetchImplUsed: meta.fetchImplUsed
+  };
+}
+function isFailure(value) {
+  return Boolean(value) && value.__hermesSilentFetchError === true;
+}
+function isSliceMissing(value) {
+  return value !== void 0 && value.missing === true;
+}
+function validateUrl(url) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return `silent.fetch: not a valid absolute URL: ${JSON.stringify(url)}`;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return `silent.fetch: unsupported URL scheme ${JSON.stringify(parsed.protocol)} (only http/https)`;
+  }
+  return parsed.origin ? void 0 : `silent.fetch: url has no origin: ${JSON.stringify(url)}`;
+}
+async function pushChunk(payload) {
+  try {
+    const response = await chrome.runtime.sendMessage({
+      target: "offscreen",
+      type: "silent.fetch.chunk",
+      id: payload.id,
+      seq: payload.seq,
+      dataB64: payload.dataB64,
+      last: payload.last
+    });
+    return Boolean(response?.ok);
+  } catch {
+    return false;
+  }
+}
+const KILLED_ERROR = "silent.fetch: the worker servicing this request was killed before it completed";
+const DEFAULT_SW_DEADLINE_MARGIN_MS = 4e3;
+let swDeadlineMarginMs = DEFAULT_SW_DEADLINE_MARGIN_MS;
+async function raceDeadline(promise, ms) {
+  let timer;
+  const timeoutMarker = new Promise((resolve) => {
+    timer = setTimeout(() => resolve({ timedOut: true }), Math.max(0, ms));
+  });
+  try {
+    return await Promise.race([promise.then((value) => ({ timedOut: false, value })), timeoutMarker]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+const KEEPALIVE_TICK_MS = 2e4;
+let activeSilentFetchCount = 0;
+let keepAliveTimer = null;
+function beginKeepAlive(tabId) {
+  activeSilentFetchCount += 1;
+  if (keepAliveTimer) return;
+  keepAliveTimer = setInterval(() => {
+    void chrome.tabs.get(tabId).catch(() => {
+    });
+  }, KEEPALIVE_TICK_MS);
+}
+function endKeepAlive() {
+  activeSilentFetchCount = Math.max(0, activeSilentFetchCount - 1);
+  if (activeSilentFetchCount === 0 && keepAliveTimer) {
+    clearInterval(keepAliveTimer);
+    keepAliveTimer = null;
+  }
+}
+async function isWorkerReady(tabId, origin) {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    return tab.status === "complete" && safeOrigin$3(tab.url ?? "") === origin;
+  } catch {
+    return false;
+  }
+}
+async function waitForWorkerReady(tabId, origin, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  for (; ; ) {
+    if (await isWorkerReady(tabId, origin)) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, WORKER_READY_POLL_INTERVAL_MS));
+  }
+}
+function looksLikeWorkerNotReadyError(message) {
+  const m = message.toLowerCase();
+  return m.includes("about:blank") || m.includes("cannot access contents of") || m.includes("cannot access a chrome") || m.includes("frame with id") || m.includes("no tab with id") || m.includes("no frame with id");
+}
+async function handleSilentFetch(msg) {
+  if (!msg.url) {
+    return { ok: false, code: ERROR_CODES.INVALID_PARAMS, error: "silent.fetch requires a url" };
+  }
+  const urlError = validateUrl(msg.url);
+  if (urlError) {
+    return { ok: false, code: ERROR_CODES.INVALID_PARAMS, error: urlError };
+  }
+  const origin = new URL(msg.url).origin;
+  const maxBytes = Math.min(Math.max(1, Math.floor(msg.maxBytes ?? DEFAULT_MAX_BYTES)), effectiveMaxBodyBytes);
+  const timeoutMs = msg.timeoutMs ?? DEFAULT_TIMEOUT_MS$1;
+  const expect = msg.expect ?? "auto";
+  let acquired;
+  try {
+    acquired = await acquireWorker(origin, { bootstrapPath: msg.bootstrapPath, bootstrapTimeoutMs: msg.bootstrapTimeoutMs });
+  } catch (error) {
+    if (error instanceof SilentPoolError) {
+      return { ok: false, code: error.code, error: error.message };
+    }
+    return { ok: false, code: ERROR_CODES.SILENT_WORKER_LAUNCH_FAILED, error: describeError(error) };
+  }
+  let killedCode;
+  const unregister = registerInFlight(origin, (code) => {
+    killedCode = code;
+  });
+  beginKeepAlive(acquired.tabId);
+  try {
+    const bufferKey = `__hermes_sf_${crypto.randomUUID()}`;
+    const fetchImpl = msg.fetchImpl === "native" ? "native" : "page";
+    const args = {
+      url: msg.url,
+      method: (msg.method ?? "GET").toUpperCase(),
+      headers: msg.headers ?? {},
+      body: msg.body ?? null,
+      credentials: msg.credentials ?? "include",
+      timeoutMs,
+      maxBytes,
+      expect,
+      bufferKey,
+      bufferTtlMs: BUFFER_TTL_MS,
+      inlineThreshold: SLICE_BYTES,
+      fetchImpl
+    };
+    const injectOnce = () => chrome.scripting.executeScript({
+      target: { tabId: acquired.tabId },
+      world: "MAIN",
+      func: pageSilentFetchImpl,
+      args: [args],
+      // Silent Fetch rev 4 §D: document_idle (the default) waits for the
+      // worker tab's DOMContentLoaded-equivalent lifecycle point AGAIN --
+      // pointless here, since acquireWorker's own bootstrap already
+      // guarantees the tab reached DOMContentLoaded (silent-pool.ts's
+      // waitForTopFrameLoad) before ever handing the worker out, and a
+      // still-loading heavy page's OWN document_idle can arrive late (or,
+      // per that same rev 3 fix, sometimes not at all in Chrome's own
+      // observed sense) well after the tab is already perfectly injectable.
+      injectImmediately: true
+    });
+    if (!await isWorkerReady(acquired.tabId, origin)) {
+      await waitForWorkerReady(acquired.tabId, origin, WORKER_READY_RETRY_WAIT_MS);
+    }
+    const fetchStartedAt = Date.now();
+    const swDeadlineAt = fetchStartedAt + timeoutMs + swDeadlineMarginMs;
+    const remainingMs = () => Math.max(0, swDeadlineAt - Date.now());
+    const abortAndCleanup = async () => {
+      try {
+        await chrome.scripting.executeScript({
+          target: { tabId: acquired.tabId },
+          world: "MAIN",
+          func: pageSilentFetchAbortImpl,
+          args: [{ bufferKey }],
+          injectImmediately: true
+        });
+      } catch {
+      }
+    };
+    const readProgress = async () => {
+      try {
+        const result = await chrome.scripting.executeScript({
+          target: { tabId: acquired.tabId },
+          world: "MAIN",
+          func: pageSilentFetchProgressImpl,
+          args: [{ bufferKey }],
+          injectImmediately: true
+        });
+        return result[0]?.result;
+      } catch {
+        return void 0;
+      }
+    };
+    const buildTimeoutResult = async (fallbackPhase, overrides) => {
+      const progress = overrides ? void 0 : await readProgress();
+      await abortAndCleanup();
+      const phase = progress?.phase ?? fallbackPhase;
+      const bytesSoFar = overrides?.bytesSoFar ?? progress?.bytesSoFar ?? 0;
+      const fetchNative = overrides?.fetchNative ?? progress?.fetchNative;
+      const phaseElapsedMs = Math.max(0, Date.now() - (progress?.phaseStartedAt ?? fetchStartedAt));
+      const data = {
+        phase,
+        phase_elapsed_ms: phaseElapsedMs,
+        bytes_so_far: bytesSoFar,
+        fetch_native: fetchNative,
+        inject_immediately_used: true,
+        ...overrides?.sliceIndex !== void 0 ? { slice_index: overrides.sliceIndex } : {}
+      };
+      return {
+        ok: false,
+        code: ERROR_CODES.TIMEOUT,
+        error: `silent.fetch: no response within ${timeoutMs}ms of its own deadline (phase=${phase}, bytes_so_far=${bytesSoFar}${fetchNative === false ? ", fetch was already wrapped/non-native" : ""}) -- the worker tab's own page timers can be throttled while hidden/minimized, so this deadline is tracked by the service worker itself, independent of the page`,
+        data
+      };
+    };
+    let startResult;
+    try {
+      const raced = await raceDeadline(injectOnce(), remainingMs());
+      if (killedCode) return { ok: false, code: killedCode, error: KILLED_ERROR };
+      if (raced.timedOut) return await buildTimeoutResult("page_fetch_headers");
+      startResult = raced.value;
+    } catch (error) {
+      if (killedCode) return { ok: false, code: killedCode, error: KILLED_ERROR };
+      const message = describeError(error);
+      if (!looksLikeWorkerNotReadyError(message)) {
+        return { ok: false, code: ERROR_CODES.CDP_ERROR, error: `silent.fetch: could not inject into worker tab: ${message}` };
+      }
+      const recovered = await waitForWorkerReady(acquired.tabId, origin, WORKER_READY_RETRY_WAIT_MS);
+      if (killedCode) return { ok: false, code: killedCode, error: KILLED_ERROR };
+      if (!recovered) {
+        return {
+          ok: false,
+          code: ERROR_CODES.SILENT_WORKER_LAUNCH_FAILED,
+          error: `silent.fetch: worker tab at ${origin} never settled after a cold-start injection failure (${message})`
+        };
+      }
+      try {
+        const racedRetry = await raceDeadline(injectOnce(), remainingMs());
+        if (killedCode) return { ok: false, code: killedCode, error: KILLED_ERROR };
+        if (racedRetry.timedOut) return await buildTimeoutResult("page_fetch_headers");
+        startResult = racedRetry.value;
+      } catch (retryError) {
+        if (killedCode) return { ok: false, code: killedCode, error: KILLED_ERROR };
+        return {
+          ok: false,
+          code: ERROR_CODES.SILENT_WORKER_LAUNCH_FAILED,
+          error: `silent.fetch: worker tab still failed injection after one retry: ${describeError(retryError)}`
+        };
+      }
+    }
+    const outcome = startResult[0]?.result;
+    if (killedCode) return { ok: false, code: killedCode, error: KILLED_ERROR };
+    if (!outcome) {
+      return { ok: false, code: ERROR_CODES.CDP_ERROR, error: "silent.fetch produced no result" };
+    }
+    if (isFailure(outcome)) {
+      const code = outcome.kind === "timeout" ? ERROR_CODES.TIMEOUT : ERROR_CODES.CDP_ERROR;
+      return {
+        ok: false,
+        code,
+        error: outcome.message,
+        data: { fetch_native: outcome.fetchNative, fetch_impl: outcome.fetchImplUsed }
+      };
+    }
+    const common = {
+      status: outcome.status,
+      headers: outcome.headers,
+      set_cookie_names: outcome.setCookieNames,
+      set_cookie_count: outcome.setCookieCount,
+      content_type: outcome.contentType,
+      total_bytes: outcome.totalBytes,
+      total_bytes_source: outcome.totalBytesSource,
+      wire_truncated: outcome.wireTruncated,
+      sha256: outcome.sha256,
+      timing: { ttfb_ms: outcome.ttfbMs },
+      fetch_native: outcome.fetchNative,
+      fetch_impl: outcome.fetchImplUsed
+    };
+    if (typeof outcome.bufferedLength !== "number") {
+      return {
+        ok: true,
+        data: { ...common, chunks: 0, bodyEncoding: outcome.bodyEncoding, body: outcome.inlineBody ?? "" }
+      };
+    }
+    let seq = 0;
+    for (; ; ) {
+      let sliceResult;
+      try {
+        const racedSlice = await raceDeadline(
+          chrome.scripting.executeScript({
+            target: { tabId: acquired.tabId },
+            world: "MAIN",
+            func: pageSilentFetchSliceImpl,
+            args: [{ bufferKey, index: seq, sliceBytes: SLICE_BYTES }],
+            injectImmediately: true
+          }),
+          remainingMs()
+        );
+        if (killedCode) return { ok: false, code: killedCode, error: KILLED_ERROR };
+        if (racedSlice.timedOut) {
+          return await buildTimeoutResult("slicing", {
+            bytesSoFar: seq * SLICE_BYTES,
+            fetchNative: outcome.fetchNative,
+            sliceIndex: seq
+          });
+        }
+        sliceResult = racedSlice.value;
+      } catch (error) {
+        if (killedCode) return { ok: false, code: killedCode, error: KILLED_ERROR };
+        return { ok: false, code: ERROR_CODES.CDP_ERROR, error: `silent.fetch: chunk slice ${seq} failed: ${describeError(error)}` };
+      }
+      const slice = sliceResult[0]?.result;
+      if (killedCode) return { ok: false, code: killedCode, error: KILLED_ERROR };
+      if (!slice || isSliceMissing(slice)) {
+        return { ok: false, code: ERROR_CODES.CDP_ERROR, error: `silent.fetch: capture buffer missing at slice ${seq}` };
+      }
+      const racedPush = await raceDeadline(
+        pushChunk({ id: msg.requestId, seq, dataB64: slice.dataB64, last: slice.last }),
+        remainingMs()
+      );
+      if (killedCode) return { ok: false, code: killedCode, error: KILLED_ERROR };
+      if (racedPush.timedOut) {
+        return await buildTimeoutResult("pushing_chunk", {
+          bytesSoFar: seq * SLICE_BYTES,
+          fetchNative: outcome.fetchNative,
+          sliceIndex: seq
+        });
+      }
+      if (!racedPush.value) {
+        return { ok: false, code: ERROR_CODES.CDP_ERROR, error: "silent.fetch: could not relay a chunk to the gateway" };
+      }
+      seq += 1;
+      if (slice.last) break;
+    }
+    return { ok: true, data: { ...common, chunks: seq, bodyEncoding: "base64" } };
+  } finally {
+    unregister();
+    endKeepAlive();
+    acquired.release();
+  }
+}
+async function handleSilentKill(msg) {
+  const before = await listWorkers();
+  const matching = (msg.origin ? before.filter((w) => w.origin === msg.origin) : before).map((w) => w.origin);
+  await killWorkers(msg.origin);
+  return { ok: true, data: { killed: matching } };
+}
+async function handleSilentPool() {
+  const workers2 = await listWorkers();
+  return {
+    ok: true,
+    data: { workers: workers2.map((w) => ({ origin: w.origin, age_ms: w.ageMs, served: w.served, state: w.state })) }
   };
 }
 function toWireCookie(cookie) {
@@ -6065,6 +7376,7 @@ function pushToOffscreen$1(message) {
 }
 async function activeTab() {
   const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true, windowType: "normal" });
+  if (tab && isPoolWindow(tab.windowId)) return void 0;
   return tab;
 }
 async function syncAttached(tabIds) {
@@ -6270,6 +7582,13 @@ async function handleTabsCreate(msg, toTabRef) {
       error: `refusing to open ${msg.url} — only http and https URLs can be opened`
     };
   }
+  if (typeof msg.windowId === "number" && isPoolWindow(msg.windowId)) {
+    return {
+      ok: false,
+      code: ERROR_CODES.INTERNAL_ERROR,
+      error: "refusing to open a tab in the Hermes background worker window"
+    };
+  }
   let created;
   try {
     created = await chrome.tabs.create({
@@ -6405,6 +7724,19 @@ function paintBadge() {
   const detail = status?.lastError ? ` — ${status.lastError}` : "";
   void chrome.action.setTitle({ title: `Hermes Browser Bridge: ${status?.state ?? "disconnected"}${detail}` });
 }
+const BLINK_BADGE_TEXT = "⚡";
+const BLINK_BADGE_COLOR = "#0969da";
+const BLINK_DURATION_MS = 200;
+const BLINK_MIN_INTERVAL_MS = 1e3;
+let lastActivityBlinkAt = 0;
+function blinkSilentFetchActivity(now = Date.now) {
+  const at = now();
+  if (at - lastActivityBlinkAt < BLINK_MIN_INTERVAL_MS) return;
+  lastActivityBlinkAt = at;
+  void chrome.action.setBadgeText({ text: BLINK_BADGE_TEXT });
+  void chrome.action.setBadgeBackgroundColor({ color: BLINK_BADGE_COLOR });
+  setTimeout(() => paintBadge(), BLINK_DURATION_MS);
+}
 onSharedCountChanged(paintBadge);
 async function handleApprovalsChanged(pendingCount) {
   latestPendingApprovalCount = Math.max(0, pendingCount);
@@ -6457,7 +7789,7 @@ function tabRefOf(tab) {
 }
 async function listTabs(groupId) {
   const tabs = await chrome.tabs.query(typeof groupId === "number" ? { groupId } : {});
-  return { tabs: tabs.map(tabRefOf) };
+  return { tabs: tabs.filter((tab) => !isPoolWindow(tab.windowId) && (typeof tab.id !== "number" || !isPoolTab(tab.id))).map(tabRefOf) };
 }
 async function tabRefsFor(tabIds) {
   const refs = [];
@@ -6927,17 +8259,26 @@ async function handleStorageClearCredentials() {
     return { ok: false, error: describeError(error) };
   }
 }
+async function handleStorageGetOriginSilentModes() {
+  try {
+    return { ok: true, data: await getOriginSilentModes() };
+  } catch (error) {
+    return { ok: false, error: describeError(error) };
+  }
+}
 chrome.runtime.onInstalled.addListener(() => {
   void ensureOffscreen();
   void chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: KEEPALIVE_PERIOD_MINUTES });
   void cdp.resyncAttachments();
   registerShareContextMenus();
+  warmPoolAdoption();
 });
 chrome.runtime.onStartup.addListener(() => {
   void ensureOffscreen();
   void chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: KEEPALIVE_PERIOD_MINUTES });
   void cdp.resyncAttachments();
   registerShareContextMenus();
+  warmPoolAdoption();
 });
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === KEEPALIVE_ALARM) void ensureOffscreen();
@@ -7012,6 +8353,9 @@ chrome.runtime.onMessage.addListener(
       case "storage.clearCredentials":
         void handleStorageClearCredentials().then(sendResponse);
         return true;
+      case "storage.getOriginSilentModes":
+        void handleStorageGetOriginSilentModes().then(sendResponse);
+        return true;
       case "tabs.attach":
         void handleTabsAttach(message).then(sendResponse);
         return true;
@@ -7037,6 +8381,27 @@ chrome.runtime.onMessage.addListener(
         return true;
       case "tabs.releaseAll":
         void cdp.releaseAll().then((released) => sendResponse({ ok: true, data: { released } }));
+        return true;
+      case "pool.killAll":
+        void killPool().then((data) => sendResponse({ ok: true, data }));
+        return true;
+      case "pool.tabIds":
+        void (async () => {
+          const windowId = await getPoolWindowId();
+          if (typeof windowId !== "number") {
+            sendResponse({ ok: true, data: { tabIds: [] } });
+            return;
+          }
+          try {
+            const tabs = await chrome.tabs.query({ windowId });
+            sendResponse({
+              ok: true,
+              data: { tabIds: tabs.map((tab) => tab.id).filter((id) => typeof id === "number") }
+            });
+          } catch {
+            sendResponse({ ok: true, data: { tabIds: [] } });
+          }
+        })();
         return true;
       case "cdp.resync":
         void cdp.resyncAttachments().then((data) => sendResponse({ ok: true, data }));
@@ -7137,6 +8502,31 @@ chrome.runtime.onMessage.addListener(
           (error) => sendResponse({ ok: false, error: describeError(error) })
         );
         return true;
+      case "silent.fetch":
+        blinkSilentFetchActivity();
+        void handleSilentFetch(message).then(sendResponse).catch(
+          (error) => sendResponse({ ok: false, error: describeError(error) })
+        );
+        return true;
+      case "silent.kill":
+        void handleSilentKill(message).then(sendResponse).catch(
+          (error) => sendResponse({ ok: false, error: describeError(error) })
+        );
+        return true;
+      case "silent.pool":
+        void handleSilentPool().then(sendResponse).catch(
+          (error) => sendResponse({ ok: false, error: describeError(error) })
+        );
+        return true;
+      case "pool.configure":
+        configurePool({
+          maxWorkers: message.maxWorkers,
+          workerTtlMs: message.workerTtlMs,
+          bootstrapTimeoutMs: message.bootstrapTimeoutMs
+        });
+        configureBodyCap(message.maxBodyBytes);
+        sendResponse({ ok: true });
+        return false;
       default:
         return false;
     }

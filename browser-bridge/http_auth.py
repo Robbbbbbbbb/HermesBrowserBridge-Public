@@ -77,7 +77,7 @@ HTTP_AUTH_STATUS_SCHEMA = {
 
 
 def handle_http_auth_status(args: Dict[str, Any], **kwargs: Any) -> str:
-    device_id, err = tools_mod._resolve_device(args)
+    device_id, err = tools_mod._resolve_device(args, kwargs)
     if err:
         return err
     paused = tools_mod._paused_refusal(device_id, "http_auth")

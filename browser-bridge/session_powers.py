@@ -106,6 +106,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
 from . import audit, protocol, refusals, relay as relay_mod, state
+from . import origins as origins_mod
 from . import tools as tools_mod
 
 logger = logging.getLogger(__name__)
@@ -272,15 +273,26 @@ def _classify_private_host(hostname: str) -> Optional[str]:
 
 
 def _explicit_grant_mode(device_id: str, origin: str) -> Optional[str]:
-    """The grants-table mode for exactly ``origin``, or None if no row
-    exists — deliberately NOT ``state.get_mode``'s config-default fallback.
-    A cross-origin fetch target must be explicitly granted; falling back to
+    """The grants-table mode for ``origin``, or None if no row exists —
+    deliberately NOT ``state.get_mode``'s config-default fallback. A
+    cross-origin fetch target must be explicitly granted; falling back to
     whatever ``default_mode`` happens to be configured would defeat the
-    guard's whole purpose the day someone changes that default."""
-    for row in state.list_grants(device_id):
-        if row["origin"] == origin:
-            return row["mode"]
-    return None
+    guard's whole purpose the day someone changes that default.
+
+    Compared canonically (case, default port, trailing dot, IDN), same as
+    ``state.get_mode`` — a grant recorded under one spelling of an origin
+    (e.g. the popup wrote ``https://Example.com``) must still be found for a
+    same-origin lookup under any equivalent spelling (e.g. an agent-supplied
+    ``https://EXAMPLE.com:443/x``), which is exactly the SSRF/explicit-grant
+    bypass this module exists to close. If more than one stored spelling
+    matches, the most restrictive recorded mode wins, same rule as
+    ``get_mode``."""
+    canonical = origins_mod.canonicalize_origin(origin)
+    modes = [
+        row["mode"] for row in state.list_grants(device_id)
+        if origins_mod.canonicalize_origin(row["origin"]) == canonical
+    ]
+    return origins_mod.most_restrictive(modes, origins_mod.GRANT_MODE_RANK)
 
 
 def _ssrf_guard(device_id: str, tab_origin: str, target_url: str) -> Optional[Tuple[str, int, str]]:
@@ -309,7 +321,7 @@ def _ssrf_guard(device_id: str, tab_origin: str, target_url: str) -> Optional[Tu
         return "url has no host to fetch", protocol.INVALID_PARAMS, "no_host"
 
     target_origin = tools_mod._origin_of(target_url)
-    if target_origin == tab_origin:
+    if origins_mod.canonicalize_origin(target_origin) == origins_mod.canonicalize_origin(tab_origin):
         return None  # same-origin as the attached tab: the flagship case
 
     private_reason = _classify_private_host(hostname)
@@ -529,7 +541,7 @@ FETCH_SCHEMA = {
 
 
 def handle_fetch(args: Dict[str, Any], **kwargs: Any) -> str:
-    device_id, err = tools_mod._resolve_device(args)
+    device_id, err = tools_mod._resolve_device(args, kwargs)
     if err:
         return err
     tab, err = tools_mod._resolve_tab_target(device_id, args, kwargs, "fetch")
@@ -772,7 +784,7 @@ def _wire_cookie_bool_field(cookie: Dict[str, Any], key: str) -> Any:
 
 
 def handle_cookies(args: Dict[str, Any], **kwargs: Any) -> str:
-    device_id, err = tools_mod._resolve_device(args)
+    device_id, err = tools_mod._resolve_device(args, kwargs)
     if err:
         return err
     paused = tools_mod._paused_refusal(device_id, "cookies")
@@ -945,7 +957,7 @@ _VALID_SAME_SITE = ("no_restriction", "lax", "strict", "unspecified")
 
 
 def handle_cookies_set(args: Dict[str, Any], **kwargs: Any) -> str:
-    device_id, err = tools_mod._resolve_device(args)
+    device_id, err = tools_mod._resolve_device(args, kwargs)
     if err:
         return err
     paused = tools_mod._paused_refusal(device_id, "cookies_write")
@@ -1155,7 +1167,7 @@ def _scrub_sensitive_request_headers(headers: Any) -> Tuple[Dict[str, str], List
 
 
 def handle_network(args: Dict[str, Any], **kwargs: Any) -> str:
-    device_id, err = tools_mod._resolve_device(args)
+    device_id, err = tools_mod._resolve_device(args, kwargs)
     if err:
         return err
     tab, err = tools_mod._resolve_tab_target(device_id, args, kwargs, "network")
@@ -1628,7 +1640,7 @@ def _redact_console_text(text: Any, device_id: str, tab_id: int, origin: str) ->
 
 
 def handle_console(args: Dict[str, Any], **kwargs: Any) -> str:
-    device_id, err = tools_mod._resolve_device(args)
+    device_id, err = tools_mod._resolve_device(args, kwargs)
     if err:
         return err
     tab, err = tools_mod._resolve_tab_target(device_id, args, kwargs, "console")
@@ -1793,7 +1805,7 @@ DOWNLOADS_SCHEMA = {
 
 
 def handle_downloads(args: Dict[str, Any], **kwargs: Any) -> str:
-    device_id, err = tools_mod._resolve_device(args)
+    device_id, err = tools_mod._resolve_device(args, kwargs)
     if err:
         return err
     tab, err = tools_mod._resolve_tab_target(device_id, args, kwargs, "downloads")

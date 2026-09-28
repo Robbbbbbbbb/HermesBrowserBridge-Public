@@ -113,8 +113,14 @@ def _has_grant_row(device_id: str, origin: str) -> bool:
     ``state.get_mode`` cannot answer this — it folds "no row" and "row set to
     the default" into the same string. See this module's docstring for why the
     difference decides whether an unknown origin prompts or refuses.
+
+    Delegates to ``state.has_explicit_grant`` (canonical comparison — case,
+    default port, trailing dot, IDN) rather than re-implementing the
+    grants-table scan here: this used to compare ``origin`` literally against
+    ``state.list_grants``' raw rows, which missed a grant recorded under a
+    different (but equivalent) spelling of the same origin.
     """
-    return any(row.get("origin") == origin for row in state.list_grants(device_id))
+    return state.has_explicit_grant(device_id, origin)
 
 
 def _authorize_open(device_id: str, origin: str, url: str, session_key: str) -> Optional[Tuple[str, int]]:
@@ -165,7 +171,7 @@ def handle_open_tab(args: Dict[str, Any], **kwargs: Any) -> str:
     if url_err:
         return url_err
 
-    device_id, err = tools_mod._resolve_device(args)
+    device_id, err = tools_mod._resolve_device(args, kwargs)
     if err:
         return err
     paused = tools_mod._paused_refusal(device_id, "open_tab")

@@ -1,6 +1,6 @@
 import { P as PROTOCOL_VERSION, H as HEARTBEAT_INTERVAL_MS, E as ERROR_CODES, f as formatRefusal } from "./chunks/refusals.js";
 import { p as pausedErrorMessage } from "./chunks/pause.js";
-import { r as redactionPolicyOf, p as powerPolicyOf, l as leaseSecondsOf } from "./chunks/storage.js";
+import { r as redactionPolicyOf, p as powerPolicyOf, l as leaseSecondsOf, o as originSilentModeArrayOf } from "./chunks/storage.js";
 async function call(type, extra = {}) {
   let response;
   try {
@@ -24,6 +24,9 @@ async function setCredentials(creds) {
 }
 async function clearCredentials() {
   await call("storage.clearCredentials");
+}
+async function getOriginSilentModes() {
+  return call("storage.getOriginSilentModes");
 }
 async function getDeviceInfo() {
   const response = await chrome.runtime.sendMessage({
@@ -55,6 +58,20 @@ class BridgeClient {
   /** The gateway's `default_mode`: what an origin with no entry in `grants`
    * actually gets. "" when the gateway never reported one. */
   defaultMode = "";
+  // devices.md DV5.2/DV6: read-only device-priority info off device.hello/
+  // device.heartbeat (`_priority_hello_fields` in relay.py), absorbed the
+  // same way grants/defaultMode above are — resent every hello AND
+  // heartbeat, so an operator's CLI priority/pin change is visible with no
+  // reconnect required. Display only: the gateway alone decides device
+  // resolution, this never changes what the device may do.
+  /** This device's 1-based rank in the global priority order, or `null` when
+   * it has none. `undefined` until the first successful hello. */
+  deviceRank = void 0;
+  /** Whether the global priority order is currently pinned by the operator. */
+  priorityPinned = false;
+  /** Seconds of heartbeat silence after which this device is considered
+   * stale rather than alive (config.py's effective_device_alive_after_seconds). */
+  deviceAliveAfterS = void 0;
   ws = null;
   // BUG FIX: the open+hello watchdog for the CURRENT connect attempt. Armed
   // in _connect() right after the socket is created, cleared the instant the
@@ -80,6 +97,16 @@ class BridgeClient {
   // would invite the user to burn a pairing code they don't need.
   lastKnownPaired = false;
   outSeq = 0;
+  // Silent Fetch rev 4 §F: a frame that took a seq but never actually made it
+  // onto the wire (JSON.stringify threw on a non-serialisable value, or
+  // socket.send() itself threw) used to still burn that seq number -- the
+  // gateway's expected_in_seq then permanently skipped it, showing up as a
+  // seq_gap audit line with no way to tell which frame caused it. serialize()
+  // below now only commits a seq to `outSeq` once the frame is confirmed on
+  // the wire; a failed attempt is queued here instead and reported via
+  // conn.send_failed on the next frame that DOES go out successfully, so nothing
+  // is silently dropped even though no gap is introduced for it.
+  pendingSendFailures = [];
   expectedInSeq = 1;
   nextRequestId = 1;
   pending = /* @__PURE__ */ new Map();
@@ -122,9 +149,12 @@ class BridgeClient {
   // (ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX). Behaviorally identical.
   onInbound;
   onStatusChange;
-  constructor(onInbound, onStatusChange) {
+  onPoolConfig;
+  constructor(onInbound, onStatusChange, onPoolConfig = () => {
+  }) {
     this.onInbound = onInbound;
     this.onStatusChange = onStatusChange;
+    this.onPoolConfig = onPoolConfig;
   }
   /**
    * Never throws: this is polled every couple of seconds by the popup and
@@ -165,7 +195,10 @@ class BridgeClient {
       attachedTabIds: this.attachedTabIds,
       paused: Boolean(settings?.paused),
       grants: this.grants,
-      defaultMode: this.defaultMode
+      defaultMode: this.defaultMode,
+      deviceRank: this.deviceRank ?? null,
+      priorityPinned: this.priorityPinned,
+      deviceAliveAfterS: this.deviceAliveAfterS ?? null
     };
   }
   /** Take the grants table off a hello or heartbeat result.
@@ -189,6 +222,21 @@ class BridgeClient {
       this.grants = result.grants.filter((grant) => typeof grant?.origin === "string" && typeof grant?.mode === "string").map((grant) => ({ origin: String(grant.origin), mode: String(grant.mode) }));
     }
     if (typeof result.default_mode === "string") this.defaultMode = result.default_mode;
+    if ("device_rank" in result) {
+      this.deviceRank = typeof result.device_rank === "number" ? result.device_rank : null;
+    }
+    if (typeof result.priority_pinned === "boolean") this.priorityPinned = result.priority_pinned;
+    if (typeof result.device_alive_after_s === "number") this.deviceAliveAfterS = result.device_alive_after_s;
+    if (typeof result.max_workers === "number" || typeof result.worker_ttl_s === "number" || typeof result.max_body_bytes === "number" || typeof result.bootstrap_timeout_ms === "number") {
+      this.onPoolConfig({
+        maxWorkers: typeof result.max_workers === "number" ? result.max_workers : void 0,
+        workerTtlMs: typeof result.worker_ttl_s === "number" ? result.worker_ttl_s * 1e3 : void 0,
+        maxBodyBytes: typeof result.max_body_bytes === "number" ? result.max_body_bytes : void 0,
+        // Silent Fetch rev 3 §D: same "resent on hello AND heartbeat, absorb
+        // every time" reasoning as the siblings above.
+        bootstrapTimeoutMs: typeof result.bootstrap_timeout_ms === "number" ? result.bootstrap_timeout_ms : void 0
+      });
+    }
   }
   /** Mirror a grant the user just set, so the picker shows the new mode on the
    * next 2s poll instead of snapping back to the old one until the next
@@ -388,6 +436,36 @@ class BridgeClient {
     const settings = await getSettings();
     this.notify("state.report", { device_commit_mode: settings.commitMode });
   }
+  /**
+   * ProjectRules/silentfetch.md SF6 "Lost changes": called by offscreen.ts's
+   * `originSilentMode.changed` handler right after the popup writes a change
+   * to its per-origin "Background requests" map in chrome.storage.local
+   * (src/lib/storage.ts's setOriginSilentMode/clearOriginSilentMode).
+   *
+   * Unlike the old per-entry reportOriginSilentMode this replaces, this
+   * re-reads the FULL current map fresh (via storage-bridge.ts, same
+   * "re-read, don't trust a passed-in value" discipline as
+   * reportRedactionPolicy/reportPowerPolicy/reportDefaultMode above) and
+   * sends the WHOLE thing — the gateway now REPLACES its table with
+   * whatever arrives (hermes_plugin/state.py's replace_origin_silent_modes),
+   * so a report carrying only the one changed origin would silently clear
+   * every OTHER origin's override. Sending the full map is also what makes
+   * "clear to Default" work at all: an origin the popup just removed
+   * locally is simply absent from this array, and absence IS the clear
+   * signal under REPLACE semantics.
+   *
+   * Silently a no-op while disconnected, same as every other reportX method
+   * here — the next successful device.hello/device.heartbeat resends this
+   * same full map anyway (see sendHello()/startHeartbeat() below), which is
+   * the other half of this fix: a report is fire-and-forget over an
+   * unreliable link, so a change made (or dropped) while offline is no
+   * longer lost forever the way it was when this field wasn't part of
+   * hello/heartbeat at all.
+   */
+  async reportOriginSilentModes() {
+    const modes = await getOriginSilentModes();
+    this.notify("state.report", { origin_silent_mode: originSilentModeArrayOf(modes) });
+  }
   /** Extension → gateway request. Resolves with the result object. */
   async request(method, params = {}) {
     const socket = this.ws;
@@ -395,16 +473,18 @@ class BridgeClient {
       throw new Error("bridge is not connected");
     }
     const id = this.nextRequestId++;
-    const frame = {
+    const sent = this.serializeAndSend(socket, method, (seq) => ({
       jsonrpc: "2.0",
       id,
-      seq: ++this.outSeq,
+      seq,
       ts: Date.now(),
       method,
       params,
       ...this.session ? { session: this.session } : {}
-    };
-    socket.send(JSON.stringify(frame));
+    }));
+    if (!sent) {
+      throw new Error(`${method}: frame could not be sent`);
+    }
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
@@ -422,17 +502,78 @@ class BridgeClient {
   notify(method, params = {}) {
     const socket = this.ws;
     if (!socket || socket.readyState !== WebSocket.OPEN) return false;
-    socket.send(
-      JSON.stringify({
-        jsonrpc: "2.0",
-        seq: ++this.outSeq,
-        ts: Date.now(),
-        method,
-        params,
-        ...this.session ? { session: this.session } : {}
-      })
-    );
+    return this.serializeAndSend(socket, method, (seq) => ({
+      jsonrpc: "2.0",
+      seq,
+      ts: Date.now(),
+      method,
+      params,
+      ...this.session ? { session: this.session } : {}
+    }));
+  }
+  /** Silent Fetch rev 4 §F: the single place every outbound frame (request,
+   * notify, respond) actually serializes and sends — so seq assignment
+   * follows one rule everywhere: `outSeq` is only ever advanced once the
+   * frame is confirmed to have gone out. `build(seq)` receives the CANDIDATE
+   * seq (outSeq + 1) to embed in the frame it constructs; it is called at
+   * most once. On success, `outSeq` is committed to that candidate and any
+   * previously queued send failures are flushed as `conn.send_failed`
+   * notifications (best-effort, not re-guarded against failing themselves —
+   * see flushSendFailures). On failure (JSON.stringify threw on a
+   * non-serialisable value, or socket.send() itself threw), `outSeq` is left
+   * untouched — the same candidate seq is reused by the next attempt, so a
+   * purely local failure never burns a seq number the gateway would then see
+   * as a permanent gap — and the failure is queued for the next successful
+   * send to report. */
+  serializeAndSend(socket, method, build) {
+    const candidateSeq = this.outSeq + 1;
+    let text;
+    try {
+      text = JSON.stringify(build(candidateSeq));
+    } catch (error) {
+      this.queueSendFailure(method, candidateSeq, "serialize_error");
+      return false;
+    }
+    try {
+      socket.send(text);
+    } catch (error) {
+      this.queueSendFailure(method, candidateSeq, "send_error");
+      return false;
+    }
+    this.outSeq = candidateSeq;
+    this.flushSendFailures(socket);
     return true;
+  }
+  queueSendFailure(method, seq, errorKind) {
+    if (this.pendingSendFailures.length >= 50) this.pendingSendFailures.shift();
+    this.pendingSendFailures.push({ method: method ?? "unknown", seq, error_kind: errorKind });
+  }
+  /** Best-effort: reports any queued send failures as `conn.send_failed`
+   * notifications now that the socket has just proven it can accept a frame.
+   * Each is sent independently (not itself re-queued on failure) to avoid
+   * this turning into its own retry loop. */
+  flushSendFailures(socket) {
+    if (this.pendingSendFailures.length === 0) return;
+    const failures = this.pendingSendFailures;
+    this.pendingSendFailures = [];
+    for (const failure of failures) {
+      if (socket.readyState !== WebSocket.OPEN) break;
+      try {
+        const seq = this.outSeq + 1;
+        socket.send(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            seq,
+            ts: Date.now(),
+            method: "conn.send_failed",
+            params: failure,
+            ...this.session ? { session: this.session } : {}
+          })
+        );
+        this.outSeq = seq;
+      } catch {
+      }
+    }
   }
   // -- internals ---------------------------------------------------------
   async sendHello(pairCode) {
@@ -493,7 +634,19 @@ class BridgeClient {
       // the committing-actions mode actually set in Options, rather than
       // falling back to whatever this device last reported (or "auto", if
       // it has never reported one at all).
-      device_commit_mode: settings.commitMode
+      device_commit_mode: settings.commitMode,
+      // ProjectRules/silentfetch.md SF6 "Lost changes": the FULL per-origin
+      // "Background requests" map (chrome.storage.local via storage-bridge,
+      // never cached here), sent whole on every hello — see
+      // reportOriginSilentModes()'s doc comment for why a partial report is
+      // never safe once the gateway applies this with REPLACE semantics.
+      // await'd inline (unlike the settings above, this needs its own
+      // runtime message round trip through storage-bridge.ts) rather than
+      // adding another failure mode this handshake has to recover from; a
+      // failure here degrades to "origin_silent_mode unreported this hello"
+      // (the field omitted, a no-op gateway-side) exactly like the redaction/
+      // powers heartbeat tick below tolerates a getSettings() failure.
+      origin_silent_mode: originSilentModeArrayOf(await getOriginSilentModes().catch(() => ({})))
     };
     if (pairCode) {
       params.pair_code = pairCode;
@@ -583,7 +736,11 @@ class BridgeClient {
       return;
     }
     try {
-      const result = await this.onInbound(asRequest.method, asRequest.params ?? {});
+      const result = await this.onInbound(
+        asRequest.method,
+        asRequest.params ?? {},
+        asRequest.id
+      );
       this.respond(asRequest.id, { result });
     } catch (error) {
       const code = error.code;
@@ -600,16 +757,14 @@ class BridgeClient {
   respond(id, payload) {
     const socket = this.ws;
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
-    socket.send(
-      JSON.stringify({
-        jsonrpc: "2.0",
-        id,
-        seq: ++this.outSeq,
-        ts: Date.now(),
-        ...this.session ? { session: this.session } : {},
-        ...payload
-      })
-    );
+    this.serializeAndSend(socket, "response", (seq) => ({
+      jsonrpc: "2.0",
+      id,
+      seq,
+      ts: Date.now(),
+      ...this.session ? { session: this.session } : {},
+      ...payload
+    }));
   }
   startHeartbeat(intervalMs) {
     this.stopHeartbeat();
@@ -629,7 +784,20 @@ class BridgeClient {
         leaseSeconds: void 0,
         commitMode: void 0
       })).then(
-        ({ paused, redaction, powers, defaultMode, leaseSeconds, commitMode }) => this.request("device.heartbeat", {
+        (fields) => (
+          // ProjectRules/silentfetch.md SF6 "Lost changes": a separate call
+          // (storage-bridge.ts, not getSettings() above — this map lives
+          // outside Settings) resent every heartbeat for the same reason
+          // redaction/powers/device_default_mode are — see this file's
+          // reportOriginSilentModes() for the full contract. A failure here
+          // is independent of a getSettings() failure above (one storage
+          // read failing must not silently take the other down with it) and
+          // degrades the same way: the field is simply omitted, which is a
+          // no-op gateway-side, never a reason to skip the heartbeat.
+          getOriginSilentModes().then((modes) => ({ ...fields, originSilentModes: originSilentModeArrayOf(modes) })).catch(() => ({ ...fields, originSilentModes: void 0 }))
+        )
+      ).then(
+        ({ paused, redaction, powers, defaultMode, leaseSeconds, commitMode, originSilentModes }) => this.request("device.heartbeat", {
           attached: this.attachedTabIds.map((tabId) => ({ tabId, attached: true })),
           pending_approvals: this.pendingApprovalsCount,
           uptime_ms: this.connectedAt ? Date.now() - this.connectedAt : 0,
@@ -649,7 +817,13 @@ class BridgeClient {
           ...leaseSeconds !== void 0 ? { device_lease_seconds: leaseSeconds } : {},
           // speedimprovements.md H1: same read-fresh-omit-on-failure
           // treatment as defaultMode/leaseSeconds above.
-          ...commitMode ? { device_commit_mode: commitMode } : {}
+          ...commitMode ? { device_commit_mode: commitMode } : {},
+          // SF6 "Lost changes": same treatment, checked against
+          // `undefined` specifically — an empty array (no overrides set)
+          // is a legitimate report that must still be sent (it tells the
+          // gateway to clear a table that should now be empty), unlike a
+          // storage-bridge failure (originSilentModes === undefined).
+          ...originSilentModes !== void 0 ? { origin_silent_mode: originSilentModes } : {}
         })
       ).then((result) => {
         this.lastHeartbeatAt = Date.now();
@@ -680,6 +854,7 @@ class BridgeClient {
     this.session = "";
     this.outSeq = 0;
     this.expectedInSeq = 1;
+    this.pendingSendFailures = [];
     if (socket && socket.readyState !== WebSocket.CLOSED) {
       try {
         socket.close(1e3, reason.slice(0, 120));
@@ -855,7 +1030,9 @@ function handleStatusChange(status) {
   void chrome.runtime.sendMessage({ target: "background", type: "status.changed", status }).catch(() => {
   });
 }
-const client = new BridgeClient(handleInbound, handleStatusChange);
+const client = new BridgeClient(handleInbound, handleStatusChange, (cfg) => {
+  void delegate({ target: "background", type: "pool.configure", ...cfg });
+});
 const pendingApprovals = /* @__PURE__ */ new Map();
 function notifyApprovalsChanged() {
   client.pendingApprovalsCount = pendingApprovals.size;
@@ -927,12 +1104,12 @@ function requireOk(result, fallbackCode, fallback) {
 function mergeAttached(existing, added) {
   return [.../* @__PURE__ */ new Set([...existing, ...added])];
 }
-async function handleInbound(method, params) {
-  if (!PAUSABLE_METHODS.has(method)) return runTimed(method, params);
+async function handleInbound(method, params, id) {
+  if (!PAUSABLE_METHODS.has(method)) return runTimed(method, params, id);
   if (isPaused()) throw pausedError();
   let result;
   try {
-    result = await runTimed(method, params);
+    result = await runTimed(method, params, id);
   } catch (error) {
     if (isPaused()) throw pausedError();
     throw error;
@@ -940,9 +1117,9 @@ async function handleInbound(method, params) {
   if (isPaused()) throw pausedError();
   return result;
 }
-async function runTimed(method, params) {
+async function runTimed(method, params, id) {
   const start = performance.now();
-  const result = await dispatchInbound(method, params);
+  const result = await dispatchInbound(method, params, id);
   const totalMs = Math.round((performance.now() - start) * 10) / 10;
   const existingTiming = result.timing && typeof result.timing === "object" ? result.timing : {};
   return { ...result, timing: { ...existingTiming, total_ms: totalMs } };
@@ -950,7 +1127,7 @@ async function runTimed(method, params) {
 function pausedError() {
   return bridgeError(ERROR_CODES.SHARING_PAUSED, pausedErrorMessage(cachedPauseState));
 }
-async function dispatchInbound(method, params) {
+async function dispatchInbound(method, params, id) {
   switch (method) {
     case "kill.switch": {
       typeof params.reason === "string" ? params.reason : void 0;
@@ -1008,17 +1185,17 @@ async function dispatchInbound(method, params) {
       const tabId = params.tabId;
       const result = await delegate({ target: "background", type: "tabs.release", tabId });
       const data = requireOk(result, ERROR_CODES.TARGET_NOT_ATTACHED, "release failed");
-      client.attachedTabIds = client.attachedTabIds.filter((id) => id !== tabId);
+      client.attachedTabIds = client.attachedTabIds.filter((id2) => id2 !== tabId);
       return { released: data.released ?? 0 };
     }
     case "tabs.close": {
-      const tabIds = Array.isArray(params.tabIds) ? params.tabIds.filter((id) => typeof id === "number") : [];
+      const tabIds = Array.isArray(params.tabIds) ? params.tabIds.filter((id2) => typeof id2 === "number") : [];
       const result = await delegate({ target: "background", type: "tabs.close", tabIds });
       const data = requireOk(result, ERROR_CODES.INTERNAL_ERROR, "tabs.close failed");
       const closed = data.closed ?? [];
       const refused = data.refused ?? [];
       if (closed.length) {
-        client.attachedTabIds = client.attachedTabIds.filter((id) => !closed.includes(id));
+        client.attachedTabIds = client.attachedTabIds.filter((id2) => !closed.includes(id2));
       }
       return { closed, refused };
     }
@@ -1381,6 +1558,52 @@ async function dispatchInbound(method, params) {
       });
       return requireOk(result, ERROR_CODES.TARGET_NOT_ATTACHED, "page.fetch failed");
     }
+    case "silent.fetch": {
+      const headers = params.headers && typeof params.headers === "object" && !Array.isArray(params.headers) ? params.headers : void 0;
+      const stringHeaders = headers ? Object.fromEntries(Object.entries(headers).filter((entry) => typeof entry[1] === "string")) : void 0;
+      const credentials = params.credentials === "include" || params.credentials === "same-origin" || params.credentials === "omit" ? params.credentials : void 0;
+      const expect = params.expect === "auto" || params.expect === "text" || params.expect === "json" || params.expect === "binary" ? params.expect : void 0;
+      const result = await delegate({
+        target: "background",
+        type: "silent.fetch",
+        requestId: id ?? 0,
+        url: typeof params.url === "string" ? params.url : "",
+        method: typeof params.method === "string" ? params.method : void 0,
+        headers: stringHeaders,
+        body: typeof params.body === "string" ? params.body : void 0,
+        credentials,
+        expect,
+        maxBytes: typeof params.max_bytes === "number" ? params.max_bytes : void 0,
+        timeoutMs: typeof params.timeout_ms === "number" ? params.timeout_ms : void 0,
+        bootstrapPath: typeof params.bootstrap_path === "string" ? params.bootstrap_path : void 0,
+        // Silent Fetch rev 3 §D: per-call override of the worker-launch
+        // timeout (silent-pool.ts clamps it to [5000,120000]ms regardless
+        // of what's asked for here).
+        bootstrapTimeoutMs: typeof params.bootstrap_timeout_ms === "number" ? params.bootstrap_timeout_ms : void 0,
+        // Silent Fetch rev 4 §E: any other value (including a typo'd string)
+        // is left undefined here -- silent-fetch.ts's own handleSilentFetch
+        // defaults an unrecognised value to "page", never rejects the call
+        // outright for it.
+        fetchImpl: params.fetch_impl === "native" ? "native" : params.fetch_impl === "page" ? "page" : void 0
+      });
+      return requireOk(result, ERROR_CODES.SILENT_WORKER_LAUNCH_FAILED, "silent.fetch failed");
+    }
+    case "silent.kill": {
+      const result = await delegate({
+        target: "background",
+        type: "silent.kill",
+        origin: typeof params.origin === "string" ? params.origin : void 0
+      });
+      return { killed: requireOk(result, ERROR_CODES.INTERNAL_ERROR, "silent.kill failed").killed ?? [] };
+    }
+    case "silent.pool": {
+      const result = await delegate({
+        target: "background",
+        type: "silent.pool"
+      });
+      const data = requireOk(result, ERROR_CODES.INTERNAL_ERROR, "silent.pool failed");
+      return { workers: data.workers ?? [] };
+    }
     case "cookies.get": {
       const urls = Array.isArray(params.urls) ? params.urls.filter((u) => typeof u === "string") : [];
       const result = await delegate({ target: "background", type: "cookies.get", urls });
@@ -1561,7 +1784,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       void client.unpair().then(() => sendResponse({ ok: true })).catch((error) => sendResponse({ ok: false, error: String(error) }));
       return true;
     case "killSwitch":
-      void delegate({ target: "background", type: "tabs.releaseAll" }).finally(() => {
+      void Promise.allSettled([
+        delegate({ target: "background", type: "tabs.releaseAll" }),
+        delegate({ target: "background", type: "pool.killAll" })
+      ]).finally(() => {
         client.attachedTabIds = [];
         client.notify("kill.switch", { reason: "popup kill switch" });
         client.disconnect("kill switch");
@@ -1575,6 +1801,34 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       return false;
     case "page.loadFired":
       if (!isPaused()) client.notify("page.loadFired", { tabId: message.tabId, url: message.url });
+      sendResponse({ ok: true });
+      return false;
+    case "silent.fetch.chunk": {
+      const sent = client.notify("silent.fetch.chunk", {
+        id: message.id,
+        seq: message.seq,
+        data_b64: message.dataB64,
+        ...message.last ? { last: true } : {}
+      });
+      sendResponse({ ok: sent });
+      return false;
+    }
+    case "silent.worker":
+      client.notify("silent.worker", {
+        origin: message.origin,
+        action: message.action,
+        ...message.reason !== void 0 ? { reason: message.reason } : {},
+        ...message.served !== void 0 ? { served: message.served } : {},
+        ...message.ageMs !== void 0 ? { age_ms: message.ageMs } : {},
+        // Silent Fetch rev 3 §A launch_failed diagnostics.
+        ...message.failure !== void 0 ? { failure: message.failure } : {},
+        ...message.chromeError !== void 0 ? { chrome_error: message.chromeError } : {},
+        ...message.lastUrl !== void 0 ? { last_url: message.lastUrl } : {},
+        ...message.redirects !== void 0 ? { redirects: message.redirects } : {},
+        ...message.redirectKinds !== void 0 ? { redirect_kinds: message.redirectKinds } : {},
+        ...message.readyStateReached !== void 0 ? { ready_state_reached: message.readyStateReached } : {},
+        ...message.elapsedMs !== void 0 ? { elapsed_ms: message.elapsedMs } : {}
+      });
       sendResponse({ ok: true });
       return false;
     case "auth.replayed":
@@ -1663,6 +1917,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       return true;
     case "lease.changed":
       void client.reportLeaseSeconds().then(() => sendResponse({ ok: true })).catch((error) => sendResponse({ ok: false, error: String(error) }));
+      return true;
+    case "originSilentMode.changed":
+      void client.reportOriginSilentModes().then(() => sendResponse({ ok: true })).catch((error) => sendResponse({ ok: false, error: String(error) }));
       return true;
     case "commitMode.changed":
       void client.reportCommitMode().then(() => sendResponse({ ok: true })).catch((error) => sendResponse({ ok: false, error: String(error) }));

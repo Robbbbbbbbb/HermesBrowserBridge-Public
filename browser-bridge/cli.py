@@ -45,9 +45,56 @@ def setup_cli(parser: argparse.ArgumentParser) -> None:
     pair = sub.add_parser("pair", help="print a one-time pairing code for the Chrome extension")
     pair.add_argument("--label", default="", help="note stored with the code (e.g. 'my-laptop')")
 
-    devices = sub.add_parser("devices", help="list paired devices")
+    devices = sub.add_parser(
+        "devices",
+        help="list paired devices, or manage global priority / rename a device (DV5)",
+    )
     devices.add_argument("--all", action="store_true", help="include revoked devices")
     devices.add_argument("--json", action="store_true", help="machine-readable output")
+    # DV5.1: `devices` alone still just lists (the two flags above, unchanged),
+    # but it now also accepts a sub-subcommand -- `devices priority ...` and
+    # `devices rename ...` -- dispatched from `_cmd_devices` on
+    # `args.devices_action` below. Not `required=True`: a bare
+    # `hermes browser-bridge devices` with no sub-subcommand must keep working
+    # exactly as it always has.
+    devices_sub = devices.add_subparsers(dest="devices_action")
+
+    priority = devices_sub.add_parser(
+        "priority",
+        help="set (as the operator) or clear the global device priority order, and/or pin it",
+    )
+    priority.add_argument(
+        "targets", nargs="*", metavar="<id|name>",
+        help="device id(s) or name(s), most-preferred first (names resolve case-insensitively; "
+        "ambiguous or unknown names are refused, with the candidates listed)",
+    )
+    priority.add_argument(
+        "--clear", action="store_true",
+        help="clear the global order back to empty (falls through to most-recent-heartbeat ordering)",
+    )
+    pin_group = priority.add_mutually_exclusive_group()
+    pin_group.add_argument(
+        "--pin", action="store_true",
+        help="pin the global order after applying it (or on its own, pin whatever order is already set) "
+        "-- the agent can read a pinned order but cannot reorder it until it is unpinned",
+    )
+    pin_group.add_argument(
+        "--unpin", action="store_true",
+        help="unpin the global order, on its own or alongside --clear/a new order",
+    )
+
+    rename = devices_sub.add_parser("rename", help="rename a paired device (D1: CLI/popup only, never the agent)")
+    rename.add_argument("target", metavar="<id|name>", help="the device to rename")
+    rename.add_argument(
+        "new_name", nargs="*", metavar="<new name>", default=[],
+        help="the device's new name (1-64 printable characters after control characters are stripped); "
+        "joined with spaces if given as multiple words. Omit when passing --clear",
+    )
+    rename.add_argument(
+        "--clear", action="store_true",
+        help="drop the operator's name override -- the device's own self-reported name "
+        "(from its extension settings) applies again starting with its next reconnect",
+    )
 
     revoke = sub.add_parser("revoke", help="revoke a device token and disconnect it")
     revoke.add_argument("device_id")
@@ -161,21 +208,225 @@ def _cmd_pair(args: argparse.Namespace) -> int:
     return 0
 
 
+def _liveness_label(last_seen: Optional[int], cfg: dict, revoked: bool) -> str:
+    """devices.md DV1: this CLI runs in its own short-lived process (this
+    module's own docstring — no live relay to ask), so unlike
+    relay.py's socket-backed liveness this is purely time-based off
+    state.db's `last_seen` (bumped on every hello AND heartbeat — DV1.2)
+    against the same effective_device_alive_after_seconds/
+    device_offline_after_seconds thresholds the gateway itself enforces.
+    It can therefore show "alive" for a few seconds after the socket has
+    actually dropped and before the gateway's own sweep (relay.py's
+    STALE_SWEEP_INTERVAL_SECONDS) notices — an approximation, not a live
+    read, same caveat this command's pre-existing "active"/"revoked"
+    status column already carries for anything socket-related.
+    """
+    if revoked or not last_seen:
+        return "offline"
+    age_s = (int(datetime.now(timezone.utc).timestamp() * 1000) - last_seen) / 1000
+    if age_s <= config.effective_device_alive_after_seconds(cfg):
+        return "alive"
+    if age_s <= config.effective_device_offline_after_seconds(cfg):
+        return "stale"
+    return "offline"
+
+
 def _cmd_devices(args: argparse.Namespace) -> int:
+    devices_action = getattr(args, "devices_action", None)
+    if devices_action == "priority":
+        return _cmd_devices_priority(args)
+    if devices_action == "rename":
+        return _cmd_devices_rename(args)
+    cfg = config.load()
     devices = state.list_devices(include_revoked=getattr(args, "all", False))
+    order = state.get_global_priority()
+    rank_by_id = {device_id: idx + 1 for idx, device_id in enumerate(order)}
+    pin = state.get_priority_pin()
+    for device in devices:
+        device["liveness"] = _liveness_label(device.get("last_seen"), cfg, bool(device.get("revoked_at")))
+        device["rank"] = rank_by_id.get(device["id"])
+        device["pinned"] = bool(pin["pinned"])
     if getattr(args, "json", False):
         print(json.dumps(devices, indent=2))
         return 0
     if not devices:
         print("No paired devices. Run `hermes browser-bridge pair` to add one.")
         return 0
-    print(f"{'DEVICE ID':<20} {'NAME':<22} {'PLATFORM':<10} {'LAST SEEN':<22} STATUS")
+    if pin["pinned"]:
+        print(f"Global priority: pinned by {pin.get('pinned_by') or 'operator'}")
+    else:
+        print("Global priority: not pinned")
+    print(
+        f"{'RANK':<5} {'DEVICE ID':<20} {'NAME':<22} {'PLATFORM':<10} {'LAST SEEN':<22} {'LIVENESS':<8} STATUS"
+    )
     for device in devices:
         status = "revoked" if device.get("revoked_at") else "active"
+        rank_label = f"#{device['rank']}" if device["rank"] is not None else "-"
+        pin_marker = "*" if device["rank"] is not None and pin["pinned"] else ""
         print(
-            f"{device['id']:<20} {device['name'][:21]:<22} {(device.get('platform') or '-')[:9]:<10} "
-            f"{_stamp(device.get('last_seen')):<22} {status}"
+            f"{rank_label + pin_marker:<5} {device['id']:<20} {device['name'][:21]:<22} "
+            f"{(device.get('platform') or '-')[:9]:<10} {_stamp(device.get('last_seen')):<22} "
+            f"{device['liveness']:<8} {status}"
         )
+    if any(device["rank"] is not None and pin["pinned"] for device in devices):
+        print()
+        print("* part of the pinned global order")
+    return 0
+
+
+def _resolve_device_tokens(tokens: "list[str]") -> "tuple[Optional[list], str]":
+    """DV5.1: resolve each of `tokens` (a device id or a name) into a device
+    id, most-preferred first, for `devices priority`/`devices rename`. An id
+    is matched exactly; a name is matched case-insensitively against every
+    non-revoked device. Returns (None, error_message) the first time a token
+    is unknown or ambiguous -- listing the candidates for an ambiguous name
+    rather than silently picking one -- and never partially resolves the
+    rest of the list in that case."""
+    devices = state.list_devices(include_revoked=False)
+    by_id = {device["id"]: device for device in devices}
+    resolved: "list[str]" = []
+    for token in tokens:
+        if token in by_id:
+            resolved.append(token)
+            continue
+        matches = [device for device in devices if device["name"].lower() == token.lower()]
+        if len(matches) == 1:
+            resolved.append(matches[0]["id"])
+        elif not matches:
+            return None, f"no paired device matches {token!r} (checked as an id, then as a name)"
+        else:
+            candidates = ", ".join(f"{m['id']} ({m['name']})" for m in matches)
+            return None, f"{token!r} matches more than one device: {candidates} — use the device id instead"
+    return resolved, ""
+
+
+def _cmd_devices_priority(args: argparse.Namespace) -> int:
+    targets = getattr(args, "targets", None) or []
+    clear = getattr(args, "clear", False)
+    pin_requested = getattr(args, "pin", False)
+    unpin_requested = getattr(args, "unpin", False)
+
+    if targets and clear:
+        print("--clear cannot be combined with an explicit order.")
+        return 1
+
+    if clear or targets:
+        order = [] if clear else targets
+        if order:
+            resolved, error = _resolve_device_tokens(order)
+            if error:
+                print(error)
+                return 1
+        else:
+            resolved = []
+        try:
+            state.set_global_priority(resolved, set_by="operator")
+        except ValueError as exc:
+            print(str(exc))
+            return 1
+        except state.PriorityPinnedError as exc:  # pragma: no cover -- operator writes never raise this
+            print(str(exc))
+            return 1
+        audit.record("device_priority_set", order=resolved, set_by="operator", source="cli")
+        if resolved:
+            print(f"Global priority set: {', '.join(resolved)}")
+        else:
+            print("Cleared the global device priority order.")
+
+    if pin_requested or unpin_requested:
+        _apply_priority_pin(pin_requested)
+    elif not (clear or targets):
+        # Bare `devices priority` with no targets/--clear/--pin/--unpin: show
+        # the current order and pin state rather than doing nothing silently.
+        order = state.get_global_priority()
+        pin = state.get_priority_pin()
+        print(f"Global priority: {', '.join(order) if order else '(none set)'}")
+        print(f"Pinned: {pin['pinned']}" + (f" (by {pin['pinned_by']})" if pin["pinned_by"] else ""))
+    return 0
+
+
+def _apply_priority_pin(pinned: bool) -> None:
+    before = state.get_priority_pin()
+    if before["pinned"] == pinned:
+        print(f"Global priority already {'pinned' if pinned else 'unpinned'}.")
+        return
+    state.set_priority_pin(pinned, by="operator")
+    audit.record("device_priority_pin_changed", pinned=pinned, by="operator", source="cli")
+    print(f"Global priority {'pinned' if pinned else 'unpinned'}.")
+
+
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _validate_device_name(raw: str) -> "tuple[Optional[str], str]":
+    """DV5.1 (D1): 1-64 printable characters after stripping control
+    characters. Returns (cleaned_name, "") on success, or (None,
+    error_message) — nothing is ever coerced further than the strip itself
+    (e.g. a name that is still too long after stripping is refused outright,
+    not truncated)."""
+    stripped = _CONTROL_CHARS_RE.sub("", raw).strip()
+    if not stripped:
+        return None, "device name must be 1-64 printable characters"
+    if len(stripped) > 64:
+        return None, f"device name is {len(stripped)} characters after stripping control characters; max is 64"
+    if not all(ch.isprintable() or ch == " " for ch in stripped):
+        return None, "device name must contain only printable characters"
+    return stripped, ""
+
+
+def _cmd_devices_rename(args: argparse.Namespace) -> int:
+    clear = getattr(args, "clear", False)
+    new_name = getattr(args, "new_name", None) or []
+    if clear and new_name:
+        print("--clear cannot be combined with a new name.")
+        return 1
+    if not clear and not new_name:
+        print("a new name is required (or pass --clear to drop the current override).")
+        return 1
+
+    resolved, error = _resolve_device_tokens([args.target])
+    if error:
+        print(error)
+        return 1
+    device_id = resolved[0]
+
+    if clear:
+        cleared = state.clear_device_name_override(device_id)
+        if cleared is None:
+            print(f"{device_id} has no active name override -- nothing to clear.")
+            return 0
+        audit.record("device_rename_cleared", device=device_id, before=cleared, by="operator", source="cli")
+        print(f"Cleared {device_id}'s name override (was {cleared!r}).")
+        print(
+            "The device's own self-reported name (from its extension settings) applies again "
+            "starting with its next device.hello/device.heartbeat."
+        )
+        return 0
+
+    raw_name = " ".join(new_name)
+    name, error = _validate_device_name(raw_name)
+    if error:
+        print(error)
+        return 1
+    # devices.md DV5 fix: writes hermes_plugin/state.py's device_name_override
+    # table (not just the devices.name column) so this survives the device's
+    # next reconnect -- touch_device() skips the name column entirely while
+    # an override row exists. See that table's own SCHEMA comment for why a
+    # bare devices.name write used to silently revert within one heartbeat.
+    before = state.set_device_name_override(device_id, name, set_by="operator")
+    if before is None:
+        print(f"No active device with id {device_id}.")
+        return 1
+    audit.record("device_renamed", device=device_id, before=before, after=name, by="operator", source="cli")
+    print(f"Renamed {device_id}: {before!r} -> {name!r}.")
+    print(
+        "This rename is PERMANENT -- it survives every future reconnect and is never overwritten by "
+        "the extension's own self-reported name, until `hermes browser-bridge devices rename "
+        f"{device_id} --clear` drops the override. A running gateway's live connection "
+        "(relay.py's Connection.device_name) picks up the new name on this device's next "
+        "device.hello; every other read (state.db, `devices`, `browser_bridge_status`) sees it "
+        "immediately, since they all read the devices table directly."
+    )
     return 0
 
 

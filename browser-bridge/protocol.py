@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-PROTOCOL_VERSION = "1.3"
+PROTOCOL_VERSION = "1.5"
 MIN_SUPPORTED_PROTOCOL_VERSION = "1.0"
 HEARTBEAT_INTERVAL_MS = 20000
 HEARTBEAT_TIMEOUT_MS = 60000
@@ -71,6 +71,13 @@ TAB_NOT_AGENT_OPENED = 4255  # speedimprovements.md H4: browser_bridge_tabs acti
 VIEWPORT_OUT_OF_RANGE = 4253  # speedimprovements.md G2: dom.snapshot/page.screenshot's `viewport` must have width in 320-3840 and height in 240-8000
 COMMIT_CONFIRM_REQUIRED = 4250  # speedimprovements.md H1: this is a committing action (Submit/Delete/etc) and this device is in Pause-for-confirmation mode; pass confirm: true and obtain user approval first
 COMMIT_APPROVAL_DENIED = 4251  # speedimprovements.md H1: the user declined the approval prompt for this committing action
+SILENT_ORIGIN_NOT_GRANTED = 4257  # silentfetch.md SF3/SF4: this origin is not granted for background (silent.fetch) requests -- flip its 'Background requests' popup setting, or set silent_fetch.full_implies_silent, then retry
+SILENT_WORKER_LAUNCH_FAILED = 4258  # silentfetch.md SF1: the hidden worker tab for this origin could not be created or bootstrapped within its time budget
+SILENT_WORKER_KILLED = 4259  # silentfetch.md SF1.5: the worker tab servicing this request was killed (silent.kill or the global kill switch) before it completed
+SILENT_RATE_LIMITED = 4260  # silentfetch.md SF4.4: too many silent.fetch calls for this origin; back off and retry (2 req/s default, burst 10)
+DEVICE_PRIORITY_PINNED = 4261  # devices.md: the global device priority order is pinned; only the operator (CLI/popup) can change it -- the agent can read it but not reorder it until the user unpins it
+DEVICE_NOT_ALIVE = 4262  # devices.md: an explicit or tab/session-bound device target is stale past use or offline (or paused) -- see alive_devices for the alternatives
+NO_ALIVE_DEVICE = 4263  # devices.md: no alive, unpaused device was available for an implicit (device-less) call -- see devices for each candidate's liveness
 
 ERROR_MESSAGES = {
     -32700: 'malformed frame',
@@ -134,6 +141,13 @@ ERROR_MESSAGES = {
     4253: "speedimprovements.md G2: dom.snapshot/page.screenshot's `viewport` must have width in 320-3840 and height in 240-8000",
     4250: 'speedimprovements.md H1: this is a committing action (Submit/Delete/etc) and this device is in Pause-for-confirmation mode; pass confirm: true and obtain user approval first',
     4251: 'speedimprovements.md H1: the user declined the approval prompt for this committing action',
+    4257: "silentfetch.md SF3/SF4: this origin is not granted for background (silent.fetch) requests -- flip its 'Background requests' popup setting, or set silent_fetch.full_implies_silent, then retry",
+    4258: 'silentfetch.md SF1: the hidden worker tab for this origin could not be created or bootstrapped within its time budget',
+    4259: 'silentfetch.md SF1.5: the worker tab servicing this request was killed (silent.kill or the global kill switch) before it completed',
+    4260: 'silentfetch.md SF4.4: too many silent.fetch calls for this origin; back off and retry (2 req/s default, burst 10)',
+    4261: 'devices.md: the global device priority order is pinned; only the operator (CLI/popup) can change it -- the agent can read it but not reorder it until the user unpins it',
+    4262: 'devices.md: an explicit or tab/session-bound device target is stale past use or offline (or paused) -- see alive_devices for the alternatives',
+    4263: "devices.md: no alive, unpaused device was available for an implicit (device-less) call -- see devices for each candidate's liveness",
 }
 
 CODE_HINTS = {
@@ -177,6 +191,13 @@ CODE_HINTS = {
     'VIEWPORT_OUT_OF_RANGE': "pass a viewport width between 320 and 3840 and a height between 240 and 8000, or omit viewport to use the tab's real size",
     'COMMIT_CONFIRM_REQUIRED': 'pass confirm: true on the committing act and make sure the user has approved it via the popup -- this device is in Options > Committing actions > Pause for confirmation',
     'COMMIT_APPROVAL_DENIED': 'the user declined the approval prompt; ask them directly in chat rather than retrying the same act',
+    'SILENT_ORIGIN_NOT_GRANTED': "this origin's 'Background requests' popup setting is off (or the origin isn't full+silent) -- ask the user to allow background requests for it, or use browser_bridge_fetch against an attached tab instead",
+    'SILENT_WORKER_LAUNCH_FAILED': 'retrying may succeed if this was transient; if it keeps failing, tell the user the hidden worker window could not be created',
+    'SILENT_WORKER_KILLED': 'the user (or another session) killed the worker mid-request via the popup or the global kill switch -- retry only if the task still applies',
+    'SILENT_RATE_LIMITED': 'slow down: this origin is capped at a few requests per second; wait and retry rather than looping immediately',
+    'DEVICE_PRIORITY_PINNED': 'the global device order is pinned by the operator -- ask the user to unpin it (CLI `hermes browser-bridge devices priority --unpin`, or the popup), or set a session-scoped override instead, which is never pinned',
+    'DEVICE_NOT_ALIVE': 'the target device (explicit, or the one this session/tab is already bound to) is not alive right now -- check alive_devices in the error and either wait for it to reconnect or, for a device-less call, retry without device_id so the gateway can pick a different one',
+    'NO_ALIVE_DEVICE': 'every paired device is offline, stale or paused -- check devices in the error and ask the user to reconnect or resume sharing on one of them before retrying',
 }
 
 REFUSALS = {
@@ -236,6 +257,7 @@ EXTENSION_TO_GATEWAY = (
     "device.hello",
     "grant.set",
     "kill.switch",
+    "silent.kill",
     "state.report",
 )
 
@@ -259,6 +281,9 @@ GATEWAY_TO_EXTENSION = (
     "page.read",
     "page.screenshot",
     "page.upload",
+    "silent.fetch",
+    "silent.kill",
+    "silent.pool",
     "tabs.attach",
     "tabs.close",
     "tabs.create",
@@ -277,6 +302,8 @@ EVENTS = (
     "focus.stolen",
     "network.response",
     "page.loadFired",
+    "silent.fetch.chunk",
+    "silent.worker",
     "state.redactedHit",
     "tab.changed",
 )
@@ -306,6 +333,9 @@ MILESTONES = {
     "page.read": "M1",
     "page.screenshot": "M1",
     "page.upload": "G1.3",
+    "silent.fetch": "SF3",
+    "silent.kill": "SF3",
+    "silent.pool": "SF3",
     "state.report": "M0",
     "tabs.attach": "M1",
     "tabs.close": "H4",
@@ -317,3 +347,5 @@ MILESTONES = {
 MODES = ("off", "request", "full")
 FIDELITIES = ("pixels", "ocr+layout", "text-only")
 COMMIT_MODES = ("auto", "pause")
+ORIGIN_SILENT_MODES = ("off", "ask", "always")
+ORIGIN_SILENT_MODE_REPORT_VALUES = ("off", "ask", "always", "default")

@@ -1,8 +1,9 @@
 import { s as send } from "./chunks/messages.js";
 import { f as formatRefusal } from "./chunks/refusals.js";
-import { s as setSettings, g as getSettings } from "./chunks/storage.js";
+import { s as setSettings, g as getSettings, h as clearOriginSilentMode, i as setOriginSilentMode, a as getOriginSilentModes } from "./chunks/storage.js";
 import { s as stopShortcutText } from "./chunks/pause.js";
 import { g as getReplayStore, a as attachabilityOf } from "./chunks/replay-store.js";
+import { s as sortWorkers, w as workerStateLabel, f as formatWorkerAge, c as currentBackgroundMode, d as describeDefault, B as BACKGROUND_MODE_LABEL } from "./chunks/background-requests.js";
 async function sendApproval(message) {
   try {
     const response = await chrome.runtime.sendMessage(message);
@@ -207,6 +208,12 @@ function deviceLabel(status) {
   if (status.deviceName) return { text: status.deviceName, title };
   if (status.deviceId) return { text: "(unnamed)", title };
   return { text: "—", title };
+}
+function devicePriorityText(status) {
+  if (status.deviceRank == null) {
+    return status.priorityPinned ? "not ranked (order pinned)" : "not ranked";
+  }
+  return status.priorityPinned ? `#${status.deviceRank} (pinned by operator)` : `#${status.deviceRank}`;
 }
 function statusChipState(status) {
   const connected = status.state === "connected";
@@ -510,6 +517,20 @@ const tabsApprovalBadge = document.getElementById("tabsApprovalBadge");
 const tabsCountLabel = el("tabsCountLabel");
 const gatewayUrlLine = el("gatewayUrlLine");
 const hostReconnectButton = el("hostReconnectButton");
+const backgroundReqOrigin = el("backgroundReqOrigin");
+const backgroundReqNoOrigin = el("backgroundReqNoOrigin");
+const backgroundReqGroup = el("backgroundReqGroup");
+const backgroundReqDetail = el("backgroundReqDetail");
+const backgroundReqButtons = {
+  default: el("backgroundReqDefault"),
+  off: el("backgroundReqOff"),
+  ask: el("backgroundReqAsk"),
+  always: el("backgroundReqAlways")
+};
+const backgroundWorkersList = el("backgroundWorkersList");
+const backgroundWorkersEmpty = el("backgroundWorkersEmpty");
+const backgroundWorkersStopAll = el("backgroundWorkersStopAll");
+const devicePriorityLine = el("devicePriorityLine");
 const footerDot = el("footerDot");
 const footerGatewayHost = el("footerGatewayHost");
 const footerLogs = el("footerLogs");
@@ -566,6 +587,7 @@ function render(status) {
   deviceName.textContent = device.text;
   deviceName.title = device.title;
   gatewayUrlLine.textContent = status.gatewayUrl || "—";
+  devicePriorityLine.textContent = devicePriorityText(status);
   footerDot.className = `dot ${status.state}`;
   footerGatewayHost.textContent = status.paired ? gatewayHostPort(status.gatewayUrl) : "not paired";
   pauseButtonLabel.textContent = status.paused ? "Resume Sharing" : "Pause Sharing";
@@ -830,11 +852,21 @@ function shareRow(tab) {
   row.append(statusDot, ...favicon ? [favicon] : [], info, button);
   return row;
 }
-async function renderShareOtherTabs(status, activeTabId) {
+async function fetchPoolTabIds() {
+  try {
+    const response = await send({ target: "background", type: "pool.tabIds" });
+    const data = response.ok ? response.data : void 0;
+    const ids = Array.isArray(data?.tabIds) ? data.tabIds : [];
+    return new Set(ids.filter((id) => typeof id === "number"));
+  } catch {
+    return /* @__PURE__ */ new Set();
+  }
+}
+async function renderShareOtherTabs(status, activeTabId, poolTabIds) {
   const attachedIds = new Set(status.attachedTabIds);
   const allTabs = await chrome.tabs.query({});
   const candidates = allTabs.filter(
-    (tab) => typeof tab.id === "number" && tab.id !== activeTabId && !attachedIds.has(tab.id) && attachabilityOf(tab.url).attachable
+    (tab) => typeof tab.id === "number" && tab.id !== activeTabId && !attachedIds.has(tab.id) && !poolTabIds.has(tab.id) && attachabilityOf(tab.url).attachable
   );
   const shown = candidates.slice(0, SHARE_OTHER_TABS_CAP);
   const signature = JSON.stringify(shown.map((tab) => [tab.id, tab.title, tab.url]));
@@ -852,12 +884,14 @@ async function renderShareOtherTabs(status, activeTabId) {
   tabsCountLabel.textContent = `Tabs (${candidates.length})`;
 }
 async function renderShareSection(status) {
-  const activeTab = await resolveActiveTab();
+  const poolTabIds = await fetchPoolTabIds();
+  const resolvedActiveTab = await resolveActiveTab();
+  const activeTab = resolvedActiveTab && typeof resolvedActiveTab.id === "number" && poolTabIds.has(resolvedActiveTab.id) ? void 0 : resolvedActiveTab;
   if (!activeTab || typeof activeTab.id !== "number") {
     shareActiveButton.disabled = true;
     shareActiveButton.title = "No tab found to share right now.";
     shareActiveInfo.textContent = "No tab found to share right now.";
-    await renderShareOtherTabs(status, void 0);
+    await renderShareOtherTabs(status, void 0, poolTabIds);
     return;
   }
   const alreadyShared = status.attachedTabIds.includes(activeTab.id);
@@ -865,7 +899,7 @@ async function renderShareSection(status) {
   shareActiveButton.disabled = alreadyShared || shareBusy || !known.attachable;
   shareActiveButton.title = alreadyShared ? "Already sharing this tab" : !known.attachable ? `Can't be shared — ${known.reason ?? ""}` : "";
   shareActiveInfo.textContent = `${chromeTabLabel(activeTab)} — ${safeOrigin(activeTab.url) || "—"}`;
-  await renderShareOtherTabs(status, activeTab.id);
+  await renderShareOtherTabs(status, activeTab.id, poolTabIds);
 }
 shareActiveButton.addEventListener("click", async () => {
   if (shareBusy) return;
@@ -913,9 +947,106 @@ async function renderOnboarding() {
   onboardStepGateway.hidden = !onGatewayStep;
   onboardStepPair.hidden = onGatewayStep;
 }
+let backgroundReqBusyOrigin = null;
+async function applyBackgroundChange(origin, action) {
+  if (backgroundReqBusyOrigin) return;
+  backgroundReqBusyOrigin = origin;
+  for (const button of Object.values(backgroundReqButtons)) button.disabled = true;
+  try {
+    if (action === "default") await clearOriginSilentMode(origin);
+    else await setOriginSilentMode(origin, action);
+    await send({ target: "offscreen", type: "originSilentMode.changed" });
+  } finally {
+    backgroundReqBusyOrigin = null;
+    await renderBackgroundRequests(latestStatus);
+  }
+}
+async function renderBackgroundRequests(status) {
+  const tab = await resolveActiveTab();
+  const origin = safeOrigin(tab?.url);
+  backgroundReqNoOrigin.hidden = Boolean(origin);
+  backgroundReqGroup.hidden = !origin;
+  backgroundReqDetail.hidden = !origin;
+  if (!origin) {
+    backgroundReqOrigin.textContent = "";
+    return;
+  }
+  backgroundReqOrigin.textContent = origin;
+  const overrides = await getOriginSilentModes();
+  const current = currentBackgroundMode(origin, overrides);
+  const ordinary = status ? effectiveMode(origin, status).mode : "";
+  const busy = backgroundReqBusyOrigin !== null;
+  for (const button of Object.values(backgroundReqButtons)) button.disabled = busy;
+  backgroundReqButtons.default.title = describeDefault(ordinary);
+  for (const [key, button] of Object.entries(backgroundReqButtons)) {
+    button.setAttribute("aria-checked", String(key === current));
+  }
+  backgroundReqDetail.textContent = current === "default" ? describeDefault(ordinary) : `${BACKGROUND_MODE_LABEL[current]} — set for this site. Click Default to clear it.`;
+}
+for (const [key, button] of Object.entries(backgroundReqButtons)) {
+  const action = key;
+  button.addEventListener("click", () => {
+    void resolveActiveTab().then((tab) => {
+      const origin = safeOrigin(tab?.url);
+      if (origin) void applyBackgroundChange(origin, action);
+    });
+  });
+}
+let backgroundWorkersBusy = false;
+async function renderBackgroundWorkers() {
+  const response = await send({ target: "background", type: "silent.pool" });
+  const workers = sortWorkers(response.ok ? response.data?.workers ?? [] : []);
+  const signature = JSON.stringify(workers);
+  backgroundWorkersEmpty.hidden = workers.length > 0;
+  backgroundWorkersStopAll.disabled = backgroundWorkersBusy || workers.length === 0;
+  if (!shouldRender("backgroundWorkers", backgroundWorkersList, signature)) return;
+  backgroundWorkersList.innerHTML = "";
+  for (const worker of workers) {
+    const row = document.createElement("li");
+    row.className = "tab-row";
+    const info = document.createElement("div");
+    info.className = "tab-info";
+    const originLine = document.createElement("div");
+    originLine.className = "tab-origin";
+    originLine.textContent = worker.origin;
+    const metaLine = document.createElement("div");
+    metaLine.className = "mode-source";
+    metaLine.textContent = `${workerStateLabel(worker.state)} · ${formatWorkerAge(worker.age_ms)} old · ${worker.served} served`;
+    info.append(originLine, metaLine);
+    const stopButton = document.createElement("button");
+    stopButton.className = "tab-release danger-outline";
+    stopButton.textContent = "Stop";
+    stopButton.addEventListener("click", async () => {
+      stopButton.disabled = true;
+      guard.markBusy("backgroundWorkers");
+      try {
+        await send({ target: "background", type: "silent.kill", origin: worker.origin });
+      } finally {
+        guard.clearBusy("backgroundWorkers");
+        await renderBackgroundWorkers();
+      }
+    });
+    row.append(info, stopButton);
+    backgroundWorkersList.append(row);
+  }
+}
+backgroundWorkersStopAll.addEventListener("click", async () => {
+  backgroundWorkersBusy = true;
+  backgroundWorkersStopAll.disabled = true;
+  guard.markBusy("backgroundWorkers");
+  try {
+    await send({ target: "background", type: "silent.kill" });
+  } finally {
+    backgroundWorkersBusy = false;
+    guard.clearBusy("backgroundWorkers");
+    await renderBackgroundWorkers();
+  }
+});
+let latestStatus;
 async function refresh() {
   const response = await send({ target: "offscreen", type: "status.get" });
   if (response.ok && response.data) {
+    latestStatus = response.data;
     render(response.data);
     if (!response.data.paired) await renderOnboarding();
     if (response.data.paired) await renderShareSection(response.data);
@@ -926,6 +1057,8 @@ async function refresh() {
     statusText.textContent = "Starting…";
     statusDetail.textContent = "";
   }
+  await renderBackgroundRequests(latestStatus);
+  await renderBackgroundWorkers();
 }
 onboardGatewayContinue.addEventListener("click", async () => {
   const url = onboardGatewayUrl.value.trim();

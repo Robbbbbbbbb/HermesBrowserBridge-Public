@@ -147,6 +147,12 @@ DANGEROUS_CAPABILITIES = frozenset({
 # server-side, not merely hidden client-side.
 NO_STANDING_GRANT_CAPABILITIES = frozenset({"evaluate", "upload", "http_auth"})
 
+# Capabilities whose prompt offers once/session but never "always": an
+# approval "always" promotes the whole origin to 'full', which would widen
+# every interactive capability there. Always-allow for background requests is
+# the popup's per-origin setting (origin_silent_mode) instead.
+NO_PERMANENT_GRANT_CAPABILITIES = frozenset({"silent_fetch"})
+
 # Used only by present() (the registered, host-driven transport path -- see
 # module docstring, caller #2): a host ApprovalRequest carries no browser
 # origin or one of protocol/schema.json's capability-enum values, so a
@@ -463,7 +469,7 @@ def require(
         session_key=session_key,
         surface="browser-bridge",
         allow_session=allow_standing,
-        allow_permanent=allow_standing,
+        allow_permanent=allow_standing and capability not in NO_PERMANENT_GRANT_CAPABILITIES,
         timeout_seconds=float(ttl_seconds),
     )
     audit.record(
@@ -580,6 +586,15 @@ def _apply_result(
         audit.record(
             "grant_set", device=device_id, origin=origin, capability=capability, mode="capability",
             source="approval_always",
+        )
+    elif choice == "always" and capability in NO_PERMANENT_GRANT_CAPABILITIES:
+        # Not offered by require(); if a host returns it anyway, honour it
+        # only as a session grant rather than promoting the origin to 'full'.
+        ttl_seconds = max(1, int(config.load()["approval_session_grant_ttl_hours"])) * 3600
+        state.set_session_grant(device_id, session_key, origin, capability, ttl_seconds)
+        audit.record(
+            "grant_set", device=device_id, origin=origin, capability=capability, mode="session",
+            source="approval_always_downgraded",
         )
     elif choice == "always":
         state.set_grant(device_id, origin, "full")

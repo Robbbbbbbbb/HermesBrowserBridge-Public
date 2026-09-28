@@ -72,6 +72,7 @@ from __future__ import annotations
 import functools
 import json
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -79,6 +80,7 @@ from urllib.parse import urlsplit
 
 from . import attach as attach_mod
 from . import audit, config, protocol
+from . import origins as origins_mod
 from . import refusals
 from . import relay as relay_mod
 from . import skills_hint
@@ -1153,23 +1155,380 @@ def _connected_devices() -> List[Dict[str, Any]]:
     return relay.status()["connected"]
 
 
-def _resolve_device(args: Dict[str, Any]) -> Tuple[str, str]:
-    """Return (device_id, error_json). error_json is "" on success."""
+# -- devices.md DV3: priority-aware resolution ------------------------------
+#
+# `_wrap_handler_with_timing` reads this thread-local right after a handler
+# returns and splices `device`/`failed_over_from`/`stale` into the result
+# JSON (DV3.2) -- one central place, exactly like the timing block itself.
+# Cleared at the START of every wrapped call (not only inside
+# `_resolve_device`) so a handler that never calls `_resolve_device` at all
+# can never see a stale previous call's meta leak into its own result on a
+# reused thread.
+_device_resolution = threading.local()
+
+
+def _device_rows() -> Dict[str, Dict[str, Any]]:
+    """id -> full state.py devices row, including revoked ones (needed so
+    `_resolve_device`'s D0 pin can tell "revoked" apart from "merely
+    offline" -- a name alone can't distinguish those). Revoked rows are
+    still excluded from every CANDIDATE list elsewhere (`state.list_devices`
+    default, `ordered_candidates`); this is read-only lookup metadata, never
+    itself a source of candidates."""
+    try:
+        return {d["id"]: d for d in state.list_devices(include_revoked=True)}
+    except Exception:
+        return {}
+
+
+def _resolve_device(
+    args: Dict[str, Any],
+    kwargs: Optional[Dict[str, Any]] = None,
+    *,
+    ignore_paused: bool = False,
+    audit_writes: bool = True,
+) -> Tuple[str, str]:
+    """devices.md DV3.1: priority-aware device resolution.
+
+    Returns (device_id, error_json) -- the same 2-tuple every existing call
+    site already unpacks (``device_id, err = _resolve_device(args)``), so no
+    call site's unpacking needed to change. Resolution metadata that used to
+    have nowhere to go (selected_by / failed_over_from / stale) is stashed on
+    ``_device_resolution`` for ``_wrap_handler_with_timing`` to splice into
+    the JSON result afterward (DV3.2).
+
+    ``kwargs`` is optional; when supplied (every call site updated for DV3
+    passes it) it lets this function honour D0/§2 rule 6 -- a session that
+    already has a device is PINNED to it and never fails over, refusing with
+    4262 instead of silently moving. A call site that still calls this with
+    only ``args`` (none, after this workstream) degrades to ordinary
+    priority resolution with no session pin, which only matters when more
+    than one device is connected and this raw session already has a home.
+
+    ``ignore_paused`` (default False): ``handle_release`` is documented and
+    tested ("release is not gated on pause") to always reach its device
+    regardless of pause -- releasing a lease is freeing the CALLER's own
+    bookkeeping, not reading or driving the page, so pause (a content-access
+    gate) never applied to it even before DV3. Passing True here is how it
+    keeps that contract now that pause has moved into this shared function:
+    every `paused_of` check below is skipped, as if nothing were paused.
+
+    ``audit_writes`` (default True, every existing call site unaffected):
+    devices.md DV4's ``browser_bridge_devices`` list action needs to preview
+    exactly what an implicit call would pick right now (``current_pick``)
+    through this SAME function -- "never a re-implementation" -- but without
+    recording a selection/refusal audit line for a call nothing really made.
+    Passing False suppresses every ``audit.record`` call below (the
+    selection and every refusal path); it does NOT stop
+    ``_device_resolution.meta`` from being set by the normal code paths
+    below -- ``devices_tool.py`` resets that thread-local itself right after
+    reading the device id it needed, so a preview call leaves no trace for
+    ``_wrap_handler_with_timing`` to splice into a DIFFERENT tool's result.
+
+    Order (devices.md §2 rule 3, plus DV1 liveness / DV3.3 no-failover):
+      1. An explicit ``device_id`` -- or an unambiguous device NAME, resolved
+         case-insensitively -- is used if it names a known device: alive or
+         stale, that device is used (``stale: True`` in the meta for the
+         stale case); offline is refused with 4262 and the alive list.
+      2. Otherwise, if this call carries an existing session (a raw Hermes
+         session kwarg that already resolves, via ``state.get_agent_session``,
+         to an OPEN ``agent_sessions`` row -- exactly the identity
+         ``ensure_shadow_session`` keys on) that session's device is used
+         UNCONDITIONALLY -- D0: a session is pinned to its device no matter
+         what. Alive or stale, it's used (stale flagged); revoked, unknown
+         (a foreign/stale identity, e.g. from a long-revoked or forgotten
+         device row), or offline, refuse with 4262 naming the reason; paused
+         (alive otherwise), refuse with the clearer 4103 SHARING_PAUSED --
+         either way "sessions never fail over", never picked from a fresh
+         priority scan, and never skipped just because this call's world
+         happens not to recognise the device any more (that IS the refusal
+         case, not an excuse to fall through to (3)).
+      3. Otherwise (a device-less call, or a session's very first ever call,
+         which is what ESTABLISHES its device) walk ``state.ordered_candidates``
+         and pick the first ALIVE, unpaused device -- §2 rule 1: a stale
+         device is not a candidate for IMPLICIT selection, only for an
+         explicit/session-pinned target. Every higher-ranked device skipped
+         along the way is recorded in ``failed_over_from`` with its skip
+         reason (stale/offline/paused); ``selected_by`` names which tier
+         (session_priority/global_priority/most_recent) actually won.
+      4. Nothing alive and unpaused: if every skipped candidate was skipped
+         for being PAUSED ALONE (none stale/offline) -> 4103 SHARING_PAUSED,
+         the clearer, more specific refusal, listing the paused devices.
+         Otherwise (nothing alive at all, or a mix of paused/offline/stale)
+         -> 4263 NO_ALIVE_DEVICE, listing every candidate's own liveness/
+         paused state and skip reason.
+    """
+    _device_resolution.meta = None
     if relay_mod.get_relay() is None:
         return "", _err("the bridge relay is not running", hint="the gateway may be degraded; check browser_bridge_status")
     connected = _connected_devices()
+    connected_by_id = {c["device_id"]: c for c in connected}
+    device_rows = _device_rows()
+    names = {device_id: (row.get("name") or device_id) for device_id, row in device_rows.items()}
+
+    def liveness_of(device_id: str) -> str:
+        entry = connected_by_id.get(device_id)
+        if entry is None:
+            return "offline"
+        # Fail CLOSED: a connected entry with no `liveness` key at all is
+        # "offline", not "alive" -- a real relay.py connection always
+        # carries this key (`relay.status()` stamps it via
+        # `_update_liveness` on every entry), so this only ever matters
+        # against a fixture that never modeled it, and such a fixture
+        # should be fixed to report `"liveness": "alive"` explicitly (every
+        # in-tree FakeRelay/status() stand-in that models a live connection
+        # does), not have this function assume the best on its behalf.
+        return entry.get("liveness") or "offline"
+
+    def paused_of(device_id: str) -> bool:
+        if ignore_paused:
+            return False
+        entry = connected_by_id.get(device_id)
+        return bool(entry and entry.get("paused"))
+
+    def alive_devices_detail() -> List[Dict[str, Any]]:
+        return [
+            {"device_id": d, "name": names.get(d, d), "liveness": liveness_of(d), "paused": paused_of(d)}
+            for d in connected_by_id
+        ]
+
+    def not_alive_error(device_id: str, session_bound: bool = False) -> str:
+        if not session_bound:
+            if audit_writes:
+                audit.record("device_selection_refused", device=device_id, reason="offline", session_bound=False)
+            return _err(
+                f"device {device_id!r} is not alive",
+                code=protocol.DEVICE_NOT_ALIVE,
+                hint=_hint_for_code(protocol.DEVICE_NOT_ALIVE),
+                alive_devices=alive_devices_detail(),
+            )
+        # D0's pin is unconditional (fix for a prior draft that let an
+        # unrecognised bound device silently fall through to a fresh
+        # priority scan instead of refusing -- exactly the silent re-homing
+        # D0 forbids). Name WHY it's refused as precisely as this call's
+        # world can tell: revoked and unknown get their own clear message,
+        # distinct from a merely offline/paused device.
+        row = device_rows.get(device_id)
+        if row is not None and row.get("revoked_at") is not None:
+            reason = "revoked"
+            message = f"this session's device ({device_id}) has been revoked; a session never fails over to a different device"
+        elif row is None and device_id not in connected_by_id:
+            reason = "unknown"
+            message = (
+                f"this session's device ({device_id}) is not a device this gateway recognises any more; "
+                "a session never fails over to a different device"
+            )
+        elif paused_of(device_id):
+            # The pin still never fails over (this call stays refused, not
+            # moved to a different device) -- but when the ONLY reason the
+            # pinned device can't be used is that it's paused (alive
+            # otherwise), the more specific SHARING_PAUSED (4103) is the
+            # clearer refusal, matching (3)'s "every alive candidate was
+            # only paused" branch below rather than the generic
+            # DEVICE_NOT_ALIVE.
+            if audit_writes:
+                audit.record("device_selection_refused", device=device_id, reason="paused", session_bound=True)
+            return _err(
+                "sharing is paused on this session's device; a session never fails over to a different device",
+                code=protocol.SHARING_PAUSED,
+                hint=_hint_for_code(protocol.SHARING_PAUSED),
+                alive_devices=alive_devices_detail(),
+            )
+        else:
+            reason = "offline"
+            message = "this session's device is not alive; a session never fails over to a different device"
+        if audit_writes:
+            audit.record("device_selection_refused", device=device_id, reason=reason, session_bound=True)
+        return _err(
+            message,
+            code=protocol.DEVICE_NOT_ALIVE,
+            hint=_hint_for_code(protocol.DEVICE_NOT_ALIVE),
+            alive_devices=alive_devices_detail(),
+        )
+
+    # -- 1. explicit device_id, or an unambiguous device NAME ---------------
     explicit = args.get("device_id")
     if explicit:
-        if any(c["device_id"] == explicit for c in connected):
-            return str(explicit), ""
-        return "", _err(f"device {explicit!r} is not connected", hint="call browser_bridge_status for connected devices")
-    if len(connected) == 1:
-        return connected[0]["device_id"], ""
-    if not connected:
+        target = str(explicit)
+        # Exact id match against a live connection first, byte-for-byte the
+        # old fast path ("any(c['device_id'] == explicit for c in
+        # connected)") -- this never touches `names`/`state.list_devices()`,
+        # so it keeps working against a bare-bones fake relay that models
+        # connections but never registers anything in state.py's devices
+        # table (several older suites, e.g. test_eyes_fixes_gateway.py/
+        # test_g225_frame_act.py/test_m1_vision.py/test_commit_mode.py, do
+        # exactly this).
+        if target in connected_by_id:
+            liveness = liveness_of(target)  # "offline" is impossible here
+            if liveness == "stale":
+                _device_resolution.meta = {"stale": True}
+            return target, ""
+        # Not currently connected: resolve against `state.list_devices()` to
+        # tell "a known but offline/stale device id" apart from "an
+        # unambiguous device NAME" apart from "unknown entirely".
+        if target in names:
+            return "", not_alive_error(target)
+        matches = [dev_id for dev_id, nm in names.items() if nm.lower() == target.lower()]
+        if len(matches) > 1:
+            return "", _err(
+                f"device name {explicit!r} is ambiguous; specify device_id",
+                candidates=[{"device_id": m, "name": names[m]} for m in matches],
+                code=protocol.INVALID_PARAMS,
+            )
+        if len(matches) == 1:
+            resolved = matches[0]
+            if resolved in connected_by_id:
+                liveness = liveness_of(resolved)
+                if liveness == "stale":
+                    _device_resolution.meta = {"stale": True}
+                return resolved, ""
+            return "", not_alive_error(resolved)
+        return "", _err(
+            f"device {explicit!r} is not connected", hint="call browser_bridge_status for connected devices",
+        )
+
+    # Every path below is still a device-LESS call from the caller's own
+    # point of view (no explicit device_id/name was given) -- session_id_for_order
+    # and tier_of are shared by the session-pin check (2) and the fresh
+    # priority scan (3) so BOTH can report a `device` block (DV3.2 draws the
+    # "explicit selections don't need the block" line only at (1) above).
+    session_id_for_order = None
+    if kwargs is not None:
+        raw = _session_key(kwargs)
+        if raw != _DEFAULT_SESSION:
+            session_id_for_order = raw
+
+    session_tier = set(state.get_session_priority(session_id_for_order)) if session_id_for_order else set()
+    global_tier = set(state.get_global_priority())
+
+    def tier_of(device_id: str) -> str:
+        if device_id in session_tier:
+            return "session_priority"
+        if device_id in global_tier:
+            return "global_priority"
+        return "most_recent"
+
+    # -- 2. a session that already has a device is pinned to it ------------
+    # Unconditional (D0): no "is this device known to this call's world"
+    # escape hatch -- an open session bound to device X always resolves to
+    # X, full stop. Revoked/unknown/offline/paused all refuse with 4262
+    # naming the reason (`not_alive_error`'s session_bound branch); none of
+    # them fall through to (3)'s fresh priority scan. A prior draft of this
+    # function skipped the pin whenever the bound device wasn't currently
+    # connected or registered in state.py, reasoning it must be a foreign
+    # test fixture -- but that is indistinguishable, from inside this
+    # function, from a REVOKED or long-gone real device, which is exactly
+    # the silent re-homing D0 forbids. Fixtures that reuse a bare session id
+    # across unrelated devices are fixed at the fixture level instead (a
+    # distinct id per device, or closing the session) -- see
+    # tests/test_*.py's own session-id choices.
+    if session_id_for_order is not None:
+        existing = state.get_agent_session(session_id_for_order)
+        if existing is not None and existing.get("closed_at") is None:
+            bound_device = existing["device_id"]
+            row = device_rows.get(bound_device)
+            revoked = row is not None and row.get("revoked_at") is not None
+            unknown = row is None and bound_device not in connected_by_id
+            if revoked or unknown or liveness_of(bound_device) == "offline" or paused_of(bound_device):
+                return "", not_alive_error(bound_device, session_bound=True)
+            meta: Dict[str, Any] = {
+                "device": {"id": bound_device, "name": names.get(bound_device, bound_device), "selected_by": tier_of(bound_device)},
+                "failed_over_from": [],
+            }
+            if liveness_of(bound_device) == "stale":
+                meta["stale"] = True
+            _device_resolution.meta = meta
+            return bound_device, ""
+
+    # -- 3. device-less (or session-establishing) implicit selection -------
+    candidates = list(state.ordered_candidates(session_id_for_order))
+    # This never adds a device beyond what `ordered_candidates` already
+    # would on a REAL gateway: pairing (`device.hello`) always writes a
+    # state.py devices row before a connection is ever added to
+    # relay.connections, so `connected` is always a subset of
+    # `state.list_devices()` there -- this line is dead code against a real
+    # relay, provably so, never a loosening of it. It exists only so a
+    # handful of older test suites' bare-relay fixtures (a live `connected`
+    # entry with no matching state.py row at all) still resolve instead of
+    # reporting "no device is connected" against a relay that plainly
+    # reports one; those fixtures invariably have exactly one device
+    # connected (they predate multi-device entirely), so ordering here is
+    # moot for them.
+    candidates.extend(d for d in connected_by_id if d not in candidates)
+    if not candidates:
         return "", _err("no device is connected", hint="run `hermes browser-bridge pair` and connect the extension")
+
+    failed_over_from: List[Dict[str, Any]] = []
+    for device_id in candidates:
+        liveness = liveness_of(device_id)
+        if liveness == "offline":
+            failed_over_from.append({"device_id": device_id, "name": names.get(device_id, device_id), "reason": "offline"})
+            continue
+        if paused_of(device_id):
+            failed_over_from.append({"device_id": device_id, "name": names.get(device_id, device_id), "reason": "paused"})
+            continue
+        if liveness == "stale":
+            # §2 rule 1: only ALIVE devices are candidates for IMPLICIT
+            # selection -- an explicit/session-pinned target may still use a
+            # stale one (above), but an implicit scan skips it.
+            failed_over_from.append({"device_id": device_id, "name": names.get(device_id, device_id), "reason": "stale"})
+            continue
+        selected_by = tier_of(device_id)
+        _device_resolution.meta = {
+            "device": {"id": device_id, "name": names.get(device_id, device_id), "selected_by": selected_by},
+            "failed_over_from": failed_over_from,
+        }
+        if audit_writes and (failed_over_from or selected_by != "most_recent"):
+            audit.record(
+                "device_selected", device=device_id, selected_by=selected_by, failed_over_from=failed_over_from,
+            )
+        return device_id, ""
+
+    # -- 4. nothing alive and unpaused at all -------------------------------
+    # `failed_over_from` has exactly one entry per candidate at this point
+    # (the loop above appended one for every device_id in `candidates`
+    # without ever returning) -- its reasons tell "every alive candidate
+    # was ONLY paused" (nothing stale/offline at all) apart from "some
+    # genuinely aren't alive". Only the former gets the more specific,
+    # clearer SHARING_PAUSED (4103): a solo paused device (or several,
+    # never any dead ones) isn't "no device to select" so much as "sharing
+    # is off, ask the user to resume it" -- ignore_paused=True (handle_release)
+    # never reaches here with a "paused" reason at all, since paused_of
+    # always reports False for it, so this branch cannot fire for it.
+    reasons = {f["reason"] for f in failed_over_from}
+    if reasons and reasons == {"paused"}:
+        paused_listing = [
+            {"device_id": device_id, "name": names.get(device_id, device_id)} for device_id in candidates
+        ]
+        if audit_writes:
+            audit.record(
+                "device_selection_refused", reason="all_paused",
+                devices=[d["device_id"] for d in paused_listing],
+            )
+        return "", _err(
+            "sharing is paused on every alive device; nothing is being read or driven until sharing resumes",
+            code=protocol.SHARING_PAUSED,
+            hint=_hint_for_code(protocol.SHARING_PAUSED),
+            paused_devices=paused_listing,
+        )
+
+    failed_by_id = {f["device_id"]: f["reason"] for f in failed_over_from}
+    listing = [
+        {
+            "device_id": device_id,
+            "name": names.get(device_id, device_id),
+            "liveness": liveness_of(device_id),
+            "paused": paused_of(device_id),
+            "reason": failed_by_id.get(device_id, "offline"),
+        }
+        for device_id in candidates
+    ]
+    if audit_writes:
+        audit.record("device_selection_refused", reason="no_alive_device", devices=[l["device_id"] for l in listing])
     return "", _err(
-        "multiple devices connected; specify device_id",
-        devices=[c["device_id"] for c in connected],
+        "no alive, unpaused device to select implicitly",
+        code=protocol.NO_ALIVE_DEVICE,
+        hint=_hint_for_code(protocol.NO_ALIVE_DEVICE),
+        devices=listing,
     )
 
 
@@ -1450,6 +1809,13 @@ def handle_status(args: Dict[str, Any], **_kwargs: Any) -> str:
     # device's dict.get(...) below falls through to None cleanly.
     protocol_by_device: Dict[str, str] = {}
     protocol_current_by_device: Dict[str, bool] = {}
+    # devices.md DV1: sourced from the live Connection the same way paused/
+    # protocol_version already are above — only meaningful for a device
+    # that's actually connected; see the `liveness`/`last_heartbeat_age_s`/
+    # `clock_skew_ms` fields below for what an offline device shows instead.
+    liveness_by_device: Dict[str, str] = {}
+    heartbeat_age_by_device: Dict[str, int] = {}
+    clock_skew_by_device: Dict[str, Any] = {}
     relay_status: Dict[str, Any] = {"listening": False, "error": "relay not started"}
     if relay is not None:
         relay_status = relay.status()
@@ -1460,6 +1826,13 @@ def handle_status(args: Dict[str, Any], **_kwargs: Any) -> str:
         }
         protocol_current_by_device = {
             entry["device_id"]: bool(entry.get("protocol_up_to_date")) for entry in relay_status["connected"]
+        }
+        liveness_by_device = {entry["device_id"]: entry.get("liveness", "") for entry in relay_status["connected"]}
+        heartbeat_age_by_device = {
+            entry["device_id"]: entry.get("last_heartbeat_age_s") for entry in relay_status["connected"]
+        }
+        clock_skew_by_device = {
+            entry["device_id"]: entry.get("clock_skew_ms") for entry in relay_status["connected"]
         }
 
     devices = []
@@ -1482,6 +1855,14 @@ def handle_status(args: Dict[str, Any], **_kwargs: Any) -> str:
                 # calls a method it doesn't have, rather than after.
                 "protocol_version": protocol_by_device.get(device["id"]) if online else None,
                 "protocol_up_to_date": protocol_current_by_device.get(device["id"]) if online else None,
+                # devices.md DV1: "alive"/"stale" only ever come from a live
+                # Connection (relay.py's _update_liveness) — a device with no
+                # open socket is "offline" regardless of how recent its
+                # state.db last_seen row is (§2 rule 1). last_heartbeat_age_s/
+                # clock_skew_ms are likewise only meaningful while connected.
+                "liveness": liveness_by_device.get(device["id"], "offline") if online else "offline",
+                "last_heartbeat_age_s": heartbeat_age_by_device.get(device["id"]) if online else None,
+                "clock_skew_ms": clock_skew_by_device.get(device["id"]) if online else None,
                 # G0.6: what this device is currently allowed to DO (upload,
                 # dialogs, evaluate, console, cookie writes, http auth,
                 # downloads), so the agent can see its actual capabilities
@@ -1621,7 +2002,7 @@ RELEASE_SCHEMA = {
 
 
 def handle_attach(args: Dict[str, Any], **kwargs: Any) -> str:
-    device_id, err = _resolve_device(args)
+    device_id, err = _resolve_device(args, kwargs)
     if err:
         return err
     paused = _paused_refusal(device_id, "attach")
@@ -1782,7 +2163,11 @@ def _extension_released_count(ext_result: Dict[str, Any], fallback: int) -> int:
 
 
 def handle_release(args: Dict[str, Any], **kwargs: Any) -> str:
-    device_id, err = _resolve_device(args)
+    # ignore_paused=True: releasing a lease frees the caller's OWN
+    # bookkeeping; it was never gated on pause even before DV3 (see
+    # `_resolve_device`'s own docstring on this parameter), so pause must
+    # never disqualify or refuse the device this call resolves to.
+    device_id, err = _resolve_device(args, kwargs, ignore_paused=True)
     if err:
         return err
     holder, err = _resolve_session(device_id, kwargs)
@@ -2096,40 +2481,14 @@ FRAME_MARKER_END = "\x00FRAME-END\x00"
 
 
 def _canonicalize_origin(origin: str) -> str:
-    """Canonical form of an origin string, mirrored EXACTLY by
-    `extension/src/lib/origin-policy.ts`'s `canonicalizeOrigin` — the shared
-    vector file `fixtures/origin-normalization-cases.json` is what both
-    sides' tests run against, so the two can't silently drift. Without this,
-    two spellings of the same origin (`https://Bank.Example` vs
-    `https://bank.example`, `:443` vs no port, a trailing DNS-root dot, a
-    unicode IDN host vs. its punycode form) would compare unequal and a
-    genuinely-granted origin could read as denied, or vice versa.
-
-    The opaque-origin sentinel `"null"` passes through unchanged. Lowercases
-    scheme and host, strips the scheme's default port, strips a trailing dot
-    from the host, and IDNA-encodes a unicode host to its ASCII (punycode)
-    form. A malformed/unparseable `origin` passes through unchanged too
-    (never raises) — it simply won't match anything in a real grant list,
-    which is safe.
-    """
-    if not origin or origin == "null":
-        return origin
-    try:
-        parts = urlsplit(origin)
-        scheme = parts.scheme.lower()
-        host = (parts.hostname or "").rstrip(".")
-        try:
-            host = host.encode("idna").decode("ascii").lower()
-        except (UnicodeError, ValueError):
-            host = host.lower()
-        port = parts.port
-        default_port = {"http": 80, "https": 443}.get(scheme)
-        if port is not None and port == default_port:
-            port = None
-        netloc = host if port is None else f"{host}:{port}"
-        return f"{scheme}://{netloc}"
-    except ValueError:
-        return origin
+    """Canonical form of an origin string. Re-exported from
+    `hermes_plugin/origins.py` (moved there so `state.py`'s grants storage
+    layer can canonicalize without importing this module, which already
+    imports `state` and would make that a cycle) — kept as a module-level
+    name here so every existing caller and test in this codebase, and
+    `relay.py`'s own `_canonical_origin` lazy import of it, keeps working
+    unchanged. See `origins.canonicalize_origin` for the full contract."""
+    return origins_mod.canonicalize_origin(origin)
 
 
 def _origin_policy_for_device(device_id: str) -> Tuple[List[str], List[str]]:
@@ -2538,7 +2897,7 @@ def _resolve_root_selector(device_id: str, tab_id: int, root: Any) -> Tuple[Opti
 
 
 def handle_snapshot(args: Dict[str, Any], **kwargs: Any) -> str:
-    device_id, err = _resolve_device(args)
+    device_id, err = _resolve_device(args, kwargs)
     if err:
         return err
     tabs_arg = args.get("tabs")
@@ -2919,7 +3278,7 @@ def _find_sort_key(m: Dict[str, Any]) -> Tuple[int, int, int]:
 
 
 def handle_find(args: Dict[str, Any], **kwargs: Any) -> str:
-    device_id, err = _resolve_device(args)
+    device_id, err = _resolve_device(args, kwargs)
     if err:
         return err
     tab, err = _resolve_tab_target(device_id, args, kwargs, "find")
@@ -3090,7 +3449,7 @@ READ_SCHEMA = {
 
 
 def handle_read(args: Dict[str, Any], **kwargs: Any) -> str:
-    device_id, err = _resolve_device(args)
+    device_id, err = _resolve_device(args, kwargs)
     if err:
         return err
     tabs_arg = args.get("tabs")
@@ -5042,7 +5401,7 @@ def _handle_act_steps(device_id: str, args: Dict[str, Any], steps_arg: Any, kwar
 
 
 def handle_act(args: Dict[str, Any], **kwargs: Any) -> Any:
-    device_id, err = _resolve_device(args)
+    device_id, err = _resolve_device(args, kwargs)
     if err:
         return err
 
@@ -5179,7 +5538,7 @@ ASK_SCHEMA = {
 
 
 def handle_ask(args: Dict[str, Any], **kwargs: Any) -> str:
-    device_id, err = _resolve_device(args)
+    device_id, err = _resolve_device(args, kwargs)
     if err:
         return err
     tab, err = _resolve_attached_tab(device_id, args.get("tab_id"), "ask")
@@ -5394,16 +5753,43 @@ def _wrap_handler_with_timing(name: str, handler: Callable[..., str]) -> Callabl
     @functools.wraps(handler)
     def wrapped(args: Dict[str, Any], **kwargs: Any) -> str:
         timing_mod.reset()
-        start = time.monotonic()
-        raw = handler(args, **kwargs)
-        total_ms = (time.monotonic() - start) * 1000.0
-        tool_timing = timing_mod.build_tool_timing(total_ms)
+        # devices.md DV3.2: reset at the START of every wrapped call (not
+        # only inside `_resolve_device`) so a handler that never calls
+        # `_resolve_device` at all can never inherit a previous call's
+        # leftover meta from a reused worker thread -- and cleared again in
+        # the `finally` below (read once into `resolution_meta` first, so
+        # THIS call's own splice still sees it) so a call that raises, or
+        # simply never calls `_resolve_device`, can never leave stale meta
+        # sitting there for whatever call happens to reuse this thread next.
+        _device_resolution.meta = None
+        resolution_meta: Optional[Dict[str, Any]] = None
+        try:
+            start = time.monotonic()
+            raw = handler(args, **kwargs)
+            total_ms = (time.monotonic() - start) * 1000.0
+            tool_timing = timing_mod.build_tool_timing(total_ms)
+            resolution_meta = getattr(_device_resolution, "meta", None)
+        finally:
+            _device_resolution.meta = None
         try:
             data = json.loads(raw)
         except (TypeError, ValueError):
             data = None
         if isinstance(data, dict):
             data["timing"] = tool_timing
+            # devices.md DV3.2: one central splice point for every implicit
+            # device selection's result block, exactly like `timing` above --
+            # no individual handler had to be touched. Explicit selections
+            # (or resolution paths this workstream didn't touch) leave
+            # `_device_resolution.meta` unset entirely, so `device` /
+            # `failed_over_from` / `stale` are simply absent, not empty.
+            if resolution_meta:
+                if resolution_meta.get("device") is not None:
+                    data.setdefault("device", resolution_meta["device"])
+                if resolution_meta.get("failed_over_from"):
+                    data.setdefault("failed_over_from", resolution_meta["failed_over_from"])
+                if resolution_meta.get("stale"):
+                    data.setdefault("stale", True)
             if name in PAGE_CONTENT_TOOLS:
                 data["content_trust"] = CONTENT_TRUST_UNTRUSTED
                 hits: List[Dict[str, str]] = []
@@ -5623,6 +6009,33 @@ def register_tools(ctx) -> list[str]:
         inspect_tools = inspect_tool.register_inspect_tools(ctx)
         if inspect_tools:
             registered.extend(inspect_tools)
+    except ImportError:
+        pass
+
+    # SF5 (silentfetch.md): browser_bridge_silent_fetch, the headless
+    # origin-fetch lane (no attach, no lease, no tab id). Same defensive
+    # seam as every block above -- a checkout without silent_fetch.py
+    # degrades to "no silent-fetch tool", not a failed plugin load.
+    try:
+        from . import silent_fetch as silent_fetch_mod  # noqa: PLC0415 - optional sibling module, see docstring
+
+        silent_fetch_tools = silent_fetch_mod.register_silent_fetch_tools(ctx)
+        if silent_fetch_tools:
+            registered.extend(silent_fetch_tools)
+    except ImportError:
+        pass
+
+    # DV4 (devices.md): browser_bridge_devices (list/set_priority/
+    # clear_priority). Same defensive seam as every block above -- a
+    # checkout without devices_tool.py degrades to "no priority tool, DV3's
+    # own implicit resolution keeps working unchanged", not a failed plugin
+    # load.
+    try:
+        from . import devices_tool  # noqa: PLC0415 - optional sibling module, see docstring
+
+        devices_tools = devices_tool.register_devices_tools(ctx)
+        if devices_tools:
+            registered.extend(devices_tools)
     except ImportError:
         pass
 

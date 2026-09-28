@@ -170,7 +170,7 @@ def _attached_tabs_for_device(device_id: str) -> List[Dict[str, Any]]:
 
 
 def handle_session(args: Dict[str, Any], **kwargs: Any) -> str:
-    device_id, err = tools_mod._resolve_device(args)
+    device_id, err = tools_mod._resolve_device(args, kwargs)
     if err:
         return err
 

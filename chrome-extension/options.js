@@ -1,5 +1,5 @@
 import { s as send } from "./chunks/messages.js";
-import { g as getSettings, s as setSettings, d as clampReplayRetention, e as clampLeaseSeconds } from "./chunks/storage.js";
+import { g as getSettings, s as setSettings, e as clampReplayRetention, f as clampLeaseSeconds } from "./chunks/storage.js";
 const el$2 = (id) => document.getElementById(id);
 const POINTER_ANIMATION_MODES = ["normal", "fast", "off"];
 function normalizePointerAnimation(value) {

@@ -889,14 +889,15 @@ def _match_target(attached: List[Dict[str, Any]], target: str) -> Tuple[Optional
     return None, f"{len(matched)} attached tabs match target={target!r}; pass the tabId instead"
 
 
-def _resolve_target(args: Dict[str, Any]) -> Tuple[str, Dict[str, Any], str]:
+def _resolve_target(args: Dict[str, Any], kwargs: Optional[Dict[str, Any]] = None) -> Tuple[str, Dict[str, Any], str]:
     """Return (device_id, tab, origin) or raise _TargetError.
 
-    Device selection is tools._resolve_device (explicit ``device_id``, else
-    the only connected device). ``origin`` is never '': a tab whose origin
-    cannot be derived is refused here, naming the tab, before any grant check.
+    Device selection is tools._resolve_device (explicit ``device_id``, a
+    session-pinned device, or devices.md DV3's priority/failover scan).
+    ``origin`` is never '': a tab whose origin cannot be derived is refused
+    here, naming the tab, before any grant check.
     """
-    device_id, err = tools_mod._resolve_device(args)
+    device_id, err = tools_mod._resolve_device(args, kwargs)
     if err:
         raise _TargetError(err)
     paused = tools_mod._paused_refusal(device_id, "screenshot")
@@ -1338,7 +1339,7 @@ def handle_screenshot(ctx, args: Dict[str, Any], **kwargs: Any) -> Any:
         viewport_req = {"width": int(vp["width"]), "height": int(vp["height"])}
 
     try:
-        device_id, tab, origin = _resolve_target(args)
+        device_id, tab, origin = _resolve_target(args, kwargs)
     except _TargetError as exc:
         return exc.error_json
     tab_id = tab.get("tabId")
