@@ -86,6 +86,12 @@ I had Hermes use Browser Bridge to access VMware ESXi and stand up a new Ubuntu 
 * 2nd Run: 43 minutes
 * 3rd Run: 18 minutes
 
+## Silent Fetch
+
+_New in v0.2.4_
+
+Browser Bridge allows your bridged Chrome instance to share its fingerprint silently with Hermes. This helps to avoid limitations imposed by agent-restrictive APIs (including search providers) since the traffic's fingerprint mirrors your actual browser's rather than the built-in headless browser that your agent has.
+
 ## Safety controls
 
 - The gateway and the extension both enforce each site's access mode.
