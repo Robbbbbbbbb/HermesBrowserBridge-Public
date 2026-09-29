@@ -741,7 +741,14 @@ COOKIES_SCHEMA = {
             "tab": {"type": "string", "description": "Alternative to tab_id, only used to pick a default when urls is omitted -- " + tools_mod.TAB_ALIAS_DESC},
             "include_values": {
                 "type": "boolean",
-                "description": "Reveal actual cookie values. Default false — prefer the metadata-only default whenever you don't need to use the raw value.",
+                "description": (
+                    "Reveal actual cookie values. Default false — prefer metadata-only unless you need the raw values. "
+                    "Values exist so the agent can run origin requests directly from the gateway host when the site's "
+                    "edge protection accepts a browser-issued session (e.g. with a Chrome-compatible HTTP client); "
+                    "treat values as credentials — temp-file them, never echo to chat/logs. Pair with the origin's "
+                    "consent state: useful only after the user's browser has already solved that site's first-load "
+                    "interstitial."
+                ),
             },
         },
         "required": [],

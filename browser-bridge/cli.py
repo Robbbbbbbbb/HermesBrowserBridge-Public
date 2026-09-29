@@ -1,4 +1,4 @@
-"""``hermes browser-bridge`` CLI: pair, devices, revoke, logs, status, export, skills.
+"""``hermes browser-bridge`` CLI: pair, devices, revoke, logs, status, export, skills, silent.
 
 Registered through ``ctx.register_cli_command``; ``setup_cli`` receives the
 argparse subparser for ``browser-bridge`` and adds its own sub-subcommands.
@@ -39,7 +39,7 @@ from . import audit, config, relay as relay_mod, skill_links, state
 
 def setup_cli(parser: argparse.ArgumentParser) -> None:
     sub = parser.add_subparsers(
-        dest="browser_command", metavar="{pair,devices,revoke,logs,status,export,skills}"
+        dest="browser_command", metavar="{pair,devices,revoke,logs,status,export,skills,silent}"
     )
 
     pair = sub.add_parser("pair", help="print a one-time pairing code for the Chrome extension")
@@ -141,6 +141,17 @@ def setup_cli(parser: argparse.ArgumentParser) -> None:
         help="overwrite --out if it already exists and is non-empty",
     )
 
+    silent = sub.add_parser("silent", help="operate background (silent) workers: `silent kill`")
+    silent_sub = silent.add_subparsers(dest="silent_action")
+    kill = silent_sub.add_parser(
+        "kill",
+        help="close a stuck background worker (silent.kill) on a connected device -- only works when the "
+        "relay runs in this process; otherwise use the agent tool browser_bridge_silent_kill",
+    )
+    kill.add_argument("origin", nargs="?", default="", help="origin whose worker to close, e.g. https://example.com")
+    kill.add_argument("--all", action="store_true", help="close EVERY worker (instead of one origin)")
+    kill.add_argument("--device", default="", metavar="<id|name>", help="only this device (default: every connected device)")
+
     skills = sub.add_parser(
         "skills",
         help="show how bridge references and product skills are linked (read-only)",
@@ -158,10 +169,11 @@ def handle_cli(args: argparse.Namespace) -> int:
         "status": _cmd_status,
         "export": _cmd_export,
         "skills": _cmd_skills,
+        "silent": _cmd_silent,
     }
     handler = handlers.get(command or "")
     if handler is None:
-        print("usage: hermes browser-bridge {pair,devices,revoke,logs,status,export,skills}")
+        print("usage: hermes browser-bridge {pair,devices,revoke,logs,status,export,skills,silent}")
         return 1
     return handler(args)
 
@@ -596,6 +608,67 @@ def _cmd_export(args: argparse.Namespace) -> int:
     print()
     print(_EXPORT_CONTENTS_NOTE)
     return 0
+
+
+def _cmd_silent(args: argparse.Namespace) -> int:
+    if getattr(args, "silent_action", None) != "kill":
+        print("usage: hermes browser-bridge silent kill [ORIGIN] [--all] [--device DEVICE_ID]")
+        return 1
+    from . import origins as origins_mod  # noqa: PLC0415
+    from . import silent_grants  # noqa: PLC0415
+    from . import tools as tools_mod  # noqa: PLC0415
+
+    raw_origin = (getattr(args, "origin", "") or "").strip()
+    kill_all = bool(getattr(args, "all", False))
+    if raw_origin and kill_all:
+        print("Pass either an ORIGIN or --all, not both.")
+        return 1
+    if not raw_origin and not kill_all:
+        print("Pass an ORIGIN to close one worker, or --all to close every worker.")
+        return 1
+    origin = ""
+    if raw_origin:
+        origin = origins_mod.canonicalize_origin(tools_mod._origin_of(raw_origin))
+        if not origin:
+            print(f"{raw_origin!r} is not a valid origin or URL.")
+            return 1
+    relay = relay_mod.get_relay()
+    if relay is None:
+        print(
+            "The relay is not running in this process (it lives in the gateway), so this command cannot reach "
+            "the extension from here. Have the agent call browser_bridge_silent_kill, or wait for the "
+            "gateway's automatic reclaim after a timeout."
+        )
+        return 1
+    connected = [c["device_id"] for c in relay.status()["connected"]]
+    device_arg = (getattr(args, "device", "") or "").strip()
+    if device_arg:
+        resolved, error = _resolve_device_tokens([device_arg])
+        if resolved is None:
+            print(error)
+            return 1
+        targets = resolved
+        if targets[0] not in connected:
+            print(f"Device {targets[0]} is not connected.")
+            return 1
+    else:
+        targets = connected
+    if not targets:
+        print("No device is connected.")
+        return 1
+    failed = 0
+    for device_id in targets:
+        outcome = silent_grants.reclaim_worker(
+            device_id, origin or None, trigger="operator", method="silent.kill", relay=relay
+        )
+        what = origin or "every worker"
+        if outcome["sent"]:
+            killed = outcome["killed"]
+            print(f"Sent silent.kill ({what}) to {device_id}; closed: {', '.join(killed) if killed else 'nothing was running'}.")
+        else:
+            failed += 1
+            print(f"Could not send silent.kill ({what}) to {device_id}: {outcome['error']}")
+    return 1 if failed else 0
 
 
 def _cmd_status(_args: argparse.Namespace) -> int:

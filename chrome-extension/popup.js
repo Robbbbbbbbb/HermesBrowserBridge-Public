@@ -1,6 +1,6 @@
 import { s as send } from "./chunks/messages.js";
 import { f as formatRefusal } from "./chunks/refusals.js";
-import { s as setSettings, g as getSettings, h as clearOriginSilentMode, i as setOriginSilentMode, a as getOriginSilentModes } from "./chunks/storage.js";
+import { g as getSettings, s as setSettings, h as clearOriginSilentMode, i as setOriginSilentMode, a as getOriginSilentModes } from "./chunks/storage.js";
 import { s as stopShortcutText } from "./chunks/pause.js";
 import { g as getReplayStore, a as attachabilityOf } from "./chunks/replay-store.js";
 import { s as sortWorkers, w as workerStateLabel, f as formatWorkerAge, c as currentBackgroundMode, d as describeDefault, B as BACKGROUND_MODE_LABEL } from "./chunks/background-requests.js";
@@ -28,7 +28,8 @@ const CAPABILITY_LABEL = {
   http_auth: "check this site's sign-in prompt",
   dialog: "accept a pop-up dialog on this page",
   downloads: "look at this site's download history",
-  console: "read this page's browser console output"
+  console: "read this page's browser console output",
+  silent_evaluate: "run custom code in a hidden background tab on this site"
 };
 const DANGEROUS_CAPABILITIES = /* @__PURE__ */ new Set([
   "upload",
@@ -37,9 +38,17 @@ const DANGEROUS_CAPABILITIES = /* @__PURE__ */ new Set([
   "http_auth",
   "dialog",
   "downloads",
-  "console"
+  "console",
+  "silent_evaluate"
 ]);
-const NO_STANDING_GRANT_CAPABILITIES = /* @__PURE__ */ new Set(["evaluate", "upload", "http_auth"]);
+const APPROVAL_POLICY_GOVERNED_CAPABILITIES = /* @__PURE__ */ new Set(["evaluate", "upload", "http_auth", "silent_evaluate"]);
+const APPROVAL_POLICY_SETTING = {
+  evaluate: "evaluateApproval",
+  upload: "uploadApproval",
+  http_auth: "httpAuthApproval",
+  // EP2: silent.evaluate follows the interactive evaluate policy.
+  silent_evaluate: "evaluateApproval"
+};
 function capabilityLabel(capability) {
   return CAPABILITY_LABEL[capability] ?? capability;
 }
@@ -56,7 +65,7 @@ function formatRemaining(ms) {
   const seconds = totalSeconds % 60;
   return `${minutes}m ${seconds.toString().padStart(2, "0")}s left`;
 }
-function renderCard(approval, onResolved) {
+function renderCard(approval, settings, onResolved) {
   const card = document.createElement("li");
   card.className = "approval-card";
   const head = document.createElement("div");
@@ -87,7 +96,7 @@ function renderCard(approval, onResolved) {
       onResolved();
     }
   };
-  const noStandingGrant = NO_STANDING_GRANT_CAPABILITIES.has(approval.capability);
+  const noStandingGrant = APPROVAL_POLICY_GOVERNED_CAPABILITIES.has(approval.capability);
   const isDangerous = DANGEROUS_CAPABILITIES.has(approval.capability);
   const onceButton = document.createElement("button");
   onceButton.className = "approval-once";
@@ -109,6 +118,16 @@ function renderCard(approval, onResolved) {
     actions.append(sessionButton);
   }
   actions.append(denyButton);
+  let policyNote = null;
+  if (noStandingGrant) {
+    const settingKey = APPROVAL_POLICY_SETTING[approval.capability];
+    const policy = settingKey ? settings[settingKey] : void 0;
+    if (policy === "ask_per_session") {
+      policyNote = document.createElement("p");
+      policyNote.className = "approval-policy-note";
+      policyNote.textContent = "Approving covers this site until the browser disconnects.";
+    }
+  }
   const alwaysRow = document.createElement("div");
   alwaysRow.className = "approval-always-row";
   const alwaysNote = document.createElement("p");
@@ -127,7 +146,9 @@ function renderCard(approval, onResolved) {
     alwaysNote.textContent = isDangerous ? "This is a standing grant for this capability only, not full access to the site." : "This is a standing grant, not a one-time approval.";
     alwaysRow.append(alwaysButton, alwaysNote);
   }
-  card.append(head, ask, summary, actions, alwaysRow);
+  card.append(head, ask, summary, actions);
+  if (policyNote) card.append(policyNote);
+  card.append(alwaysRow);
   const tick = () => {
     const remaining = approval.expiresAt - Date.now();
     ttlEl.textContent = formatRemaining(remaining);
@@ -137,13 +158,15 @@ function renderCard(approval, onResolved) {
   activeTimers.push(window.setInterval(tick, 1e3));
   return card;
 }
-function renderApprovals(container, emptyEl, countEl, approvals, onResolved) {
+async function renderApprovals(container, emptyEl, countEl, approvals, onResolved) {
   clearActiveTimers();
   container.innerHTML = "";
   emptyEl.hidden = approvals.length > 0;
   if (countEl) countEl.textContent = approvals.length > 0 ? String(approvals.length) : "";
+  if (approvals.length === 0) return;
+  const settings = await getSettings();
   for (const approval of approvals) {
-    container.append(renderCard(approval, onResolved));
+    container.append(renderCard(approval, settings, onResolved));
   }
 }
 async function fetchPendingApprovals() {
@@ -928,7 +951,7 @@ async function refreshAttached(status) {
 }
 async function refreshApprovals() {
   const approvals = await fetchPendingApprovals();
-  renderApprovals(approvalList, approvalEmpty, approvalCount, approvals, () => {
+  await renderApprovals(approvalList, approvalEmpty, approvalCount, approvals, () => {
     void refreshApprovals();
   });
   waitingApprovalHead.hidden = approvals.length === 0;

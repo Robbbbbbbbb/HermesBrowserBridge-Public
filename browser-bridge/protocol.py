@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-PROTOCOL_VERSION = "1.5"
+PROTOCOL_VERSION = "1.6"
 MIN_SUPPORTED_PROTOCOL_VERSION = "1.0"
 HEARTBEAT_INTERVAL_MS = 20000
 HEARTBEAT_TIMEOUT_MS = 60000
@@ -78,6 +78,8 @@ SILENT_RATE_LIMITED = 4260  # silentfetch.md SF4.4: too many silent.fetch calls 
 DEVICE_PRIORITY_PINNED = 4261  # devices.md: the global device priority order is pinned; only the operator (CLI/popup) can change it -- the agent can read it but not reorder it until the user unpins it
 DEVICE_NOT_ALIVE = 4262  # devices.md: an explicit or tab/session-bound device target is stale past use or offline (or paused) -- see alive_devices for the alternatives
 NO_ALIVE_DEVICE = 4263  # devices.md: no alive, unpaused device was available for an implicit (device-less) call -- see devices for each candidate's liveness
+SILENT_EVAL_TIMEOUT = 4264  # ep2-silent-evaluate.md: a silent.evaluate expression did not settle within its timeout (the background-side deadline, not CDP's own); the worker tab was recycled in case a dialog wedged it
+SILENT_WORKER_BUSY = 4265  # ep2-silent-evaluate.md: the hidden worker tab for this origin is already running a silent.fetch or silent.evaluate; calls are single-flight per worker and are rejected, not queued
 
 ERROR_MESSAGES = {
     -32700: 'malformed frame',
@@ -148,6 +150,8 @@ ERROR_MESSAGES = {
     4261: 'devices.md: the global device priority order is pinned; only the operator (CLI/popup) can change it -- the agent can read it but not reorder it until the user unpins it',
     4262: 'devices.md: an explicit or tab/session-bound device target is stale past use or offline (or paused) -- see alive_devices for the alternatives',
     4263: "devices.md: no alive, unpaused device was available for an implicit (device-less) call -- see devices for each candidate's liveness",
+    4264: "ep2-silent-evaluate.md: a silent.evaluate expression did not settle within its timeout (the background-side deadline, not CDP's own); the worker tab was recycled in case a dialog wedged it",
+    4265: 'ep2-silent-evaluate.md: the hidden worker tab for this origin is already running a silent.fetch or silent.evaluate; calls are single-flight per worker and are rejected, not queued',
 }
 
 CODE_HINTS = {
@@ -198,6 +202,8 @@ CODE_HINTS = {
     'DEVICE_PRIORITY_PINNED': 'the global device order is pinned by the operator -- ask the user to unpin it (CLI `hermes browser-bridge devices priority --unpin`, or the popup), or set a session-scoped override instead, which is never pinned',
     'DEVICE_NOT_ALIVE': 'the target device (explicit, or the one this session/tab is already bound to) is not alive right now -- check alive_devices in the error and either wait for it to reconnect or, for a device-less call, retry without device_id so the gateway can pick a different one',
     'NO_ALIVE_DEVICE': 'every paired device is offline, stale or paused -- check devices in the error and ask the user to reconnect or resume sharing on one of them before retrying',
+    'SILENT_EVAL_TIMEOUT': 'the expression ran past timeout_ms (or opened a dialog); raise timeout_ms (max per config) for a long batch, make sure the expression awaits a promise that actually settles, and never call alert/confirm/prompt',
+    'SILENT_WORKER_BUSY': "another background request or evaluation is still running on this origin's worker; wait for it to finish and retry rather than firing calls in parallel",
 }
 
 REFUSALS = {
@@ -281,6 +287,7 @@ GATEWAY_TO_EXTENSION = (
     "page.read",
     "page.screenshot",
     "page.upload",
+    "silent.evaluate",
     "silent.fetch",
     "silent.kill",
     "silent.pool",
@@ -333,6 +340,7 @@ MILESTONES = {
     "page.read": "M1",
     "page.screenshot": "M1",
     "page.upload": "G1.3",
+    "silent.evaluate": "EP2",
     "silent.fetch": "SF3",
     "silent.kill": "SF3",
     "silent.pool": "SF3",

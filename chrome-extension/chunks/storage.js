@@ -1,3 +1,11 @@
+const APPROVAL_POLICY_VALUES = /* @__PURE__ */ new Set([
+  "always_allow",
+  "ask_per_session",
+  "always_ask"
+]);
+function isApprovalPolicy(value) {
+  return typeof value === "string" && APPROVAL_POLICY_VALUES.has(value);
+}
 const DEFAULT_SETTINGS = {
   gatewayUrl: "ws://localhost:8765/bridge",
   deviceName: "",
@@ -19,7 +27,7 @@ const DEFAULT_SETTINGS = {
   allowFileUploadFromAgent: false,
   allowDialogDismiss: true,
   allowDialogAccept: false,
-  allowEvaluate: false,
+  allowEvaluate: true,
   allowConsoleRead: false,
   allowCookieWrite: false,
   allowHttpAuth: false,
@@ -32,7 +40,10 @@ const DEFAULT_SETTINGS = {
   unlimitedLease: false,
   commitMode: "auto",
   recordReplay: false,
-  replayRetention: 200
+  replayRetention: 200,
+  evaluateApproval: "always_allow",
+  uploadApproval: "ask_per_session",
+  httpAuthApproval: "ask_per_session"
 };
 const MIN_LEASE_SECONDS = 10;
 const MAX_LEASE_SECONDS = 1200;
@@ -48,11 +59,43 @@ function clampReplayRetention(value) {
   if (!Number.isFinite(value)) return DEFAULT_REPLAY_RETENTION;
   return Math.min(MAX_REPLAY_RETENTION, Math.max(MIN_REPLAY_RETENTION, Math.round(value)));
 }
+function migrateApprovalPolicies(merged, stored) {
+  let changed = false;
+  const settings = { ...merged };
+  if (stored && "evaluateApproval" in stored) {
+    if (!isApprovalPolicy(stored.evaluateApproval)) {
+      settings.evaluateApproval = "always_ask";
+      changed = true;
+    }
+  } else if (stored && "allowEvaluate" in stored) {
+    settings.evaluateApproval = stored.allowEvaluate === true ? "always_allow" : "always_ask";
+    changed = true;
+  } else {
+    settings.evaluateApproval = DEFAULT_SETTINGS.evaluateApproval;
+  }
+  for (const key of ["uploadApproval", "httpAuthApproval"]) {
+    if (stored && key in stored) {
+      if (!isApprovalPolicy(stored[key])) {
+        settings[key] = "always_ask";
+        changed = true;
+      }
+    } else {
+      settings[key] = DEFAULT_SETTINGS[key];
+    }
+  }
+  return { settings, changed };
+}
 const SETTINGS_KEY = "settings";
 const CREDENTIALS_KEY = "credentials";
 async function getSettings() {
   const stored = await chrome.storage.local.get(SETTINGS_KEY);
-  return { ...DEFAULT_SETTINGS, ...stored[SETTINGS_KEY] ?? {} };
+  const storedSettings = stored[SETTINGS_KEY];
+  const merged = { ...DEFAULT_SETTINGS, ...storedSettings ?? {} };
+  const { settings, changed } = migrateApprovalPolicies(merged, storedSettings);
+  if (changed) {
+    await chrome.storage.local.set({ [SETTINGS_KEY]: settings });
+  }
+  return settings;
 }
 async function setSettings(patch) {
   const next = { ...await getSettings(), ...patch };
@@ -110,7 +153,10 @@ function powerPolicyOf(settings) {
     allowHttpAuth: settings.allowHttpAuth,
     allowDownloadsRead: settings.allowDownloadsRead,
     uploadRoots: settings.uploadRoots,
-    maxUploadBytes: settings.maxUploadBytes
+    maxUploadBytes: settings.maxUploadBytes,
+    evaluateApproval: settings.evaluateApproval,
+    uploadApproval: settings.uploadApproval,
+    httpAuthApproval: settings.httpAuthApproval
   };
 }
 function leaseSecondsOf(settings) {

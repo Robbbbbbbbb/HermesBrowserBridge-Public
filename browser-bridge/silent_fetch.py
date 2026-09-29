@@ -530,7 +530,9 @@ SILENT_FETCH_SCHEMA = {
         "interactive lane because it runs unattended. Large responses are written whole to a local "
         "file (`body_file`) instead of blowing your context -- read it with execute_code for paging "
         "loops. `cache_ttl_s` lets a repeated call within that window skip the browser round trip "
-        "entirely (`from_cache:true`)."
+        "entirely (`from_cache:true`). For small request bursts the same origin grants the agent a "
+        "cookie-export alternative (see cookies `include_values`); the bridge is preferred for "
+        "long/unattended sweeps."
     ),
     "parameters": {
         "type": "object",
@@ -605,6 +607,50 @@ SILENT_FETCH_SCHEMA = {
         "required": ["url"],
     },
 }
+
+
+def reclaim_result(fields: Dict[str, Any], device_id: str, origin: str, trigger: str, method: str) -> str:
+    """Send the best-effort ``silent.kill {origin}`` for ``trigger`` and fold
+    the outcome into an error result (``fields`` is a ``_err_dict``). Shared
+    with silent_evaluate. Never raises."""
+    outcome = silent_grants.reclaim_worker(device_id, origin, trigger=trigger, method=method)
+    fields["worker_reclaimed"] = bool(outcome["sent"])
+    if outcome["sent"]:
+        if trigger == "relay_timeout":
+            note = (
+                "the gateway stopped waiting for this call, so it asked the extension to close this origin's "
+                "background worker; a retry gets a fresh worker"
+            )
+        else:
+            note = (
+                "this origin's background worker looked stuck from an earlier call the gateway already gave up "
+                "on, so it was closed; retry once and it gets a fresh worker"
+            )
+        fields["hint"] = f"{note}. {fields['hint']}" if fields.get("hint") else note
+    else:
+        fields["worker_reclaim_error"] = outcome["error"]
+        note = (
+            "the gateway could not reach the extension to reclaim this origin's worker, so it may stay busy; "
+            "call browser_bridge_silent_kill for this origin or ask the operator to run "
+            "`hermes browser-bridge silent kill`"
+        )
+        fields["hint"] = f"{fields['hint']} {note}" if fields.get("hint") else note
+    return json.dumps(fields, default=str)
+
+
+def bridge_err_with_reclaim(exc: "relay_mod.BridgeError", device_id: str, origin: str, method: str) -> str:
+    """``tools._bridge_err`` plus the worker-reclaim policy: a relay TIMEOUT
+    (the gateway gave up waiting) reclaims the worker; a SILENT_WORKER_BUSY the
+    gateway did not cause (nothing of its own holds the origin's slot) means the
+    extension's worker is stuck from a call already abandoned, so reclaim it
+    once. 4264 (eval timeout) and 4259 (killed) are never reclaimed -- the
+    extension already recycled the worker itself."""
+    fields = tools_mod._bridge_err_dict(exc, method)
+    if exc.code == protocol.TIMEOUT:
+        return reclaim_result(fields, device_id, origin, "relay_timeout", method)
+    if exc.code == protocol.SILENT_WORKER_BUSY and not silent_grants.slot_in_flight(device_id, origin):
+        return reclaim_result(fields, device_id, origin, "orphaned_busy", method)
+    return json.dumps(fields, default=str)
 
 
 def handle_silent_fetch(args: Dict[str, Any], **kwargs: Any) -> str:
@@ -809,10 +855,24 @@ def handle_silent_fetch(args: Dict[str, Any], **kwargs: Any) -> str:
     # (now-configurable) launch budget.
     effective_bootstrap_timeout_ms = bootstrap_timeout_ms if bootstrap_timeout_ms is not None else cfg["bootstrap_timeout_ms"]
     relay_timeout_s = (timeout_ms + effective_bootstrap_timeout_ms) / 1000.0 + 15
+    in_relay_call = False
     try:
         with silent_grants.origin_slot(device_id, origin, timeout_s=ORIGIN_SLOT_TIMEOUT_S):
+            in_relay_call = True
             result = relay.call(device_id, "silent.fetch", wire_params, timeout=relay_timeout_s)
+    except silent_grants.SilentWorkerBusy as exc:
+        silent_grants.record_silent_fetch_refused(device_id, origin, method, url, reason_class="worker_busy")
+        return tools_mod._err(
+            f"{exc}; wait for it to finish and retry", code=protocol.SILENT_WORKER_BUSY,
+            device_id=device_id, origin=origin,
+        )
     except TimeoutError as exc:
+        if in_relay_call:
+            # the relay wait itself expired (not the slot wait): same as a relay TIMEOUT
+            return reclaim_result(
+                tools_mod._err_dict(str(exc), code=protocol.TIMEOUT, device_id=device_id, origin=origin),
+                device_id, origin, "relay_timeout", "silent.fetch",
+            )
         silent_grants.record_silent_fetch_refused(device_id, origin, method, url, reason_class="origin_slot_timeout")
         return tools_mod._err(str(exc), code=protocol.TIMEOUT, device_id=device_id, origin=origin)
     except relay_mod.BridgeError as exc:
@@ -837,7 +897,7 @@ def handle_silent_fetch(args: Dict[str, Any], **kwargs: Any) -> str:
                 bytes_so_far=exc.data.get("bytes_so_far"),
                 fetch_native=exc.data.get("fetch_native"),
             )
-        return tools_mod._bridge_err(exc, "silent.fetch")
+        return bridge_err_with_reclaim(exc, device_id, origin, "silent.fetch")
 
     status = result.get("status")
     resp_headers = result.get("headers") or {}
@@ -949,6 +1009,48 @@ def handle_silent_fetch(args: Dict[str, Any], **kwargs: Any) -> str:
     return tools_mod._ok(**payload)
 
 
+SILENT_KILL_SCHEMA: Dict[str, Any] = {
+    "name": "browser_bridge_silent_kill",
+    "description": (
+        "Close the hidden background worker for one origin so the next browser_bridge_silent_fetch / "
+        "browser_bridge_silent_evaluate to it gets a fresh worker. Use it when those calls keep failing with "
+        "SILENT_WORKER_BUSY (4265) after an earlier call timed out. Always safe: it only closes the hidden "
+        "worker tab (an in-flight call to that origin fails with 4259); it never touches the user's own tabs. "
+        "The gateway already does this automatically after a timeout, so you rarely need it."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "origin": {"type": "string", "description": "The origin (or any URL on it) whose worker to close, e.g. https://example.com."},
+            "device_id": {"type": "string", "description": "Which paired browser. Omit to use the default device."},
+        },
+        "required": ["origin"],
+    },
+}
+
+
+def handle_silent_kill(args: Dict[str, Any], **kwargs: Any) -> str:
+    raw = str(args.get("origin") or "").strip()
+    if not raw:
+        return tools_mod._err("origin is required", code=protocol.INVALID_PARAMS)
+    origin = origins_mod.canonicalize_origin(tools_mod._origin_of(raw))
+    if not origin:
+        return tools_mod._err(f"origin is not a valid absolute URL or origin: {raw!r}", code=protocol.INVALID_PARAMS)
+    device_id, err = tools_mod._resolve_device(args, kwargs)
+    if err:
+        return err
+    outcome = silent_grants.reclaim_worker(device_id, origin, trigger="agent", method="silent.kill")
+    if not outcome["sent"]:
+        return tools_mod._err(
+            f"could not send silent.kill to the extension: {outcome['error']}",
+            code=protocol.INTERNAL_ERROR, device_id=device_id, origin=origin,
+        )
+    return tools_mod._ok(
+        device_id=device_id, origin=origin, killed=outcome["killed"] or [],
+        hint="the worker (if any) was closed; the next background call to this origin gets a fresh one",
+    )
+
+
 def register_silent_fetch_tools(ctx) -> List[str]:
     """Entry point ``tools.register_tools`` imports under
     ``try/except ImportError``, the same defensive seam every sibling
@@ -963,4 +1065,12 @@ def register_silent_fetch_tools(ctx) -> List[str]:
         check_fn=tools_mod.bridge_available,
         emoji="\U0001F47B",  # ghost -- an unattended, invisible fetch
     )
-    return [SILENT_FETCH_SCHEMA["name"]]
+    ctx.register_tool(
+        name=SILENT_KILL_SCHEMA["name"],
+        toolset=TOOLSET,
+        schema=SILENT_KILL_SCHEMA,
+        handler=handle_silent_kill,
+        check_fn=tools_mod.bridge_available,
+        emoji="\U0001F47B",
+    )
+    return [SILENT_FETCH_SCHEMA["name"], SILENT_KILL_SCHEMA["name"]]

@@ -27,6 +27,7 @@ import re
 import sys
 import threading
 import time
+import uuid
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
 
@@ -64,7 +65,7 @@ CLOCK_SKEW_ALERT_THRESHOLD_MS = 120_000
 # notification (protocol/schema.json) may report. Anything else is refused
 # and audited as `silent_worker_rejected` rather than trusted through.
 SILENT_WORKER_ACTIONS = frozenset(
-    {"launch", "launch_failed", "recycle", "evict", "kill", "closed", "adopted"}
+    {"launch", "launch_failed", "recycle", "evict", "kill", "closed", "adopted", "eval_wedge"}
 )
 # `reason` is a short machine token (ttl/lru/origin_drift/kill_switch/user_kill/
 # user_closed/sw_restart/nav_error, or blank) -- bounded so a misbehaving or
@@ -193,6 +194,14 @@ class Connection:
     def __init__(self, ws, remote: str):
         self.ws = ws
         self.remote = remote
+        # EP1 (ep1-contract.md): a fresh, process-local identity for THIS
+        # socket, never reused — an `ask_per_session` approval-policy grant
+        # (hermes_plugin/approvals.py) is keyed on this, not on device_id
+        # alone, so a reconnect (or a gateway restart) always gets a brand
+        # new id and can never accidentally match a grant a PREVIOUS
+        # connection earned. Set once here, for the lifetime of this object;
+        # never mutated.
+        self.connection_id: str = uuid.uuid4().hex
         self.device_id: str = ""
         self.device_name: str = ""
         self.session_id: str = ""
@@ -989,6 +998,19 @@ class Relay:
                     )
             except Exception:
                 logger.exception("browser_bridge: failed to deny pending approvals for %s", conn.device_id)
+            # EP1: an `ask_per_session` approval-policy grant is scoped to
+            # THIS connection — it must not survive past the socket that
+            # earned it, or a reconnect from a DIFFERENT origin/tab set would
+            # inherit an approval nobody gave it this time around. Cleared
+            # unconditionally on every drop, whether or not any grant was
+            # ever recorded (the common case; `clear_connection_policy_grants`
+            # is a no-op then).
+            try:
+                approvals.clear_connection_policy_grants(conn.device_id, conn.connection_id)
+            except Exception:
+                logger.exception(
+                    "browser_bridge: failed to clear policy grants for %s/%s", conn.device_id, conn.connection_id,
+                )
         if conn.device_id and self.connections.get(conn.device_id) is conn:
             del self.connections[conn.device_id]
 
@@ -1818,6 +1840,21 @@ class Relay:
 
         asyncio.run_coroutine_threadsafe(_close(), self.loop)
         return True
+
+    def connection_identity(self, device_id: str) -> str:
+        """EP1: the live `Connection.connection_id` for `device_id`, or "" if
+        not currently connected. Read from whatever thread a tool handler is
+        running on, mirroring `call()`'s/`disconnect()`'s own unlocked
+        `self.connections.get(...)` read — a plain dict lookup is safe
+        without a lock the same way theirs already are (CPython's GIL makes
+        a single dict `.get` atomic; the only thing that could race is which
+        VALUE is there, and an approvals check reading a connection_id that's
+        one `_drop`/reconnect stale just means the caller sees "not
+        connected" (empty string) instead of a match on the NEW connection's
+        id — never a false match on a grant that belongs to a dead one,
+        because a new Connection always mints a brand new uuid4."""
+        conn = self.connections.get(device_id)
+        return conn.connection_id if conn is not None else ""
 
     # -- introspection -----------------------------------------------------
 

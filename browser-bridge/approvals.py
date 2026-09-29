@@ -111,7 +111,7 @@ logger = logging.getLogger(__name__)
 
 TRANSPORT_NAME = "browser-bridge"
 
-SCOPES = ("once", "session", "always", "deny", "timeout")
+SCOPES = ("once", "session", "always", "deny", "timeout", "policy")
 _RESPONSE_CHOICES = ("once", "session", "always", "deny")
 
 # G0.5's per-capability ceiling. A pre-existing 'full' origin grant (whether
@@ -132,20 +132,175 @@ _RESPONSE_CHOICES = ("once", "session", "always", "deny")
 # that file's comment for why it isn't imported instead.
 DANGEROUS_CAPABILITIES = frozenset({
     "upload", "evaluate", "cookies_write", "http_auth", "dialog", "downloads", "console",
+    # EP2: JS in the hidden background worker; governed by the same policy row as `evaluate`.
+    "silent_evaluate",
 })
 
-# A strict subset of DANGEROUS_CAPABILITIES for which even a per-capability
-# standing grant is refused: arbitrary code execution (`evaluate`), a file
-# handed to a site off the operator's own disk (`upload`), and a saved
-# credential prompt (`http_auth`) are not things a single approve-once prompt
-# can meaningfully authorize forever, or even for the rest of a Hermes
-# session. `require()` below builds its `ApprovalRequest` with
-# `allow_session`/`allow_permanent` set to `False` for these, so the refusal
-# is enforced by the HOST's own `allowed_choices` validation (`resolve()`'s
-# `choice not in waiter.request.allowed_choices` check) -- a compromised or
-# out-of-date popup that sends "always"/"session" anyway is rejected
-# server-side, not merely hidden client-side.
-NO_STANDING_GRANT_CAPABILITIES = frozenset({"evaluate", "upload", "http_auth"})
+# EP1 (ep1-contract.md): the exact wire field name on `powerPolicy` that
+# carries each capability's approval policy, one of APPROVAL_POLICY_VALUES.
+# Mirrors extension/src/lib/storage.ts's own copy of this mapping and
+# protocol/schema.json's `definitions.powerPolicy` properties -- kept as a
+# literal dict, not derived, for the same "a capability added to one side
+# without the other is a visible diff" reason DANGEROUS_CAPABILITIES is.
+#
+# `APPROVAL_POLICY_KEYS.keys()` (four capabilities since EP2) is ALSO the full set of capabilities for
+# which the HOST's own once/session/always grant machinery
+# (approval_transport.py's ApprovalRequest, state.py's capability/session
+# grant tables) is never offered -- membership in this dict is the single
+# source of truth for both facts at once (a capability governed by an
+# approval policy IS, definitionally, one that can never earn a host-side
+# standing grant -- see `require()`'s own comment on why those two
+# properties always travel together for exactly these three).
+# Arbitrary code execution (`evaluate`), a file handed to a site off the
+# operator's own disk (`upload`), and a saved credential prompt (`http_auth`)
+# are not things a host-side "always"/"session" choice can meaningfully
+# authorize forever, or even for the rest of a Hermes session -- the host has
+# no notion of "clear this when the browser disconnects". `require()` below
+# builds its `ApprovalRequest` with `allow_session`/`allow_permanent` set to
+# `False` for these in EVERY mode (this is unconditional, not a default the
+# policy below can widen), so the refusal is enforced by the HOST's own
+# `allowed_choices` validation (`resolve()`'s `choice not in
+# waiter.request.allowed_choices` check) -- a compromised or out-of-date
+# popup that sends "always"/"session" anyway is rejected server-side, not
+# merely hidden client-side.
+#
+# None of this means every call to one of these capabilities prompts: EP1
+# gives each a per-device APPROVAL POLICY (`approval_policy()` below) that a
+# `full`-mode origin can consult to skip the prompt entirely (`always_allow`)
+# or reuse an in-memory, connection-scoped grant (`ask_per_session`) -- see
+# `approval_policy()`'s docstring. The policy is gateway-side, orthogonal to
+# the host grant machinery above, and never touches SQLite:
+# `_check_capability_grant`/`_check_session_grant` below still refuse a
+# STORED grant for one of these three capabilities on read
+# (`standing_grant_refused`), regardless of what the policy says.
+APPROVAL_POLICY_KEYS: Dict[str, str] = {
+    "evaluate": "evaluateApproval",
+    # EP2: the hidden-worker evaluate reads the SAME device policy field as
+    # interactive evaluate, but holds its own per-connection grant (the
+    # capability id is part of the grant key).
+    "silent_evaluate": "evaluateApproval",
+    "upload": "uploadApproval",
+    "http_auth": "httpAuthApproval",
+}
+
+# The three (and only three) wire values a reported *Approval field may hold.
+# Anything else -- a typo, an old extension build's absent field, a corrupt
+# stored value -- reads as "always_ask" (state.py's own parse is the actual
+# enforcement point; this tuple is shared so approvals.py never drifts from
+# it). Order matches ep1-contract.md's "Values (exact strings)" line.
+APPROVAL_POLICY_VALUES = ("always_allow", "ask_per_session", "always_ask")
+
+
+def approval_policy(device_id: str, capability: str) -> str:
+    """The approval policy currently in effect for `(device_id, capability)`,
+    straight off the device's most recently reported `powerPolicy` (never
+    cached beyond what `state.get_power_policy` itself caches). Returns one
+    of APPROVAL_POLICY_VALUES, defaulting to the safe "always_ask" for a
+    capability this mapping doesn't cover, a device that has never reported,
+    or a reported value that isn't an exact enum string (`state.py`'s
+    `_power_approval_policy` is the actual fail-closed parse; this is a thin,
+    capability-keyed wrapper over it).
+
+    Callers MUST also check the floor themselves (ep1-contract.md: the
+    policy only applies when `state.get_mode(device_id, origin) == "full"`)
+    -- this function answers "what does the device want", not "does that
+    apply right now". See `tools.py`'s `_authorize` for where the floor is
+    actually enforced.
+    """
+    field = APPROVAL_POLICY_KEYS.get(capability)
+    if field is None:
+        return "always_ask"
+    value = state.get_power_policy(device_id).get(field)
+    return value if value in APPROVAL_POLICY_VALUES else "always_ask"
+
+
+# -- ask_per_session: in-memory, connection-scoped grants ---------------------
+#
+# EP1: an `ask_per_session` policy prompts once per (device, THIS relay
+# connection, origin, capability) and then stays silent for the rest of that
+# connection's lifetime. Deliberately NOT `state.py` SQLite (that table is
+# for host "session"/"always" grants, which `APPROVAL_POLICY_KEYS` above
+# refuses for exactly these three capabilities) and deliberately keyed
+# by connection identity, not just device_id: a fresh WS connection -- a
+# reconnect, a gateway restart, a new pairing -- gets a brand-new
+# `connection_id` (relay.py's `Connection.__init__`), so a stale key here can
+# never match a live connection and there is nothing to reap on restart, the
+# same reasoning `_Waiter`'s docstring gives for not persisting approvals.
+_policy_session_lock = threading.Lock()
+_policy_session_grants: set = set()
+
+
+def _policy_session_key(device_id: str, connection_id: str, origin: str, capability: str) -> tuple:
+    return (device_id, connection_id, origin, capability)
+
+
+def has_policy_session_grant(device_id: str, connection_id: str, origin: str, capability: str) -> bool:
+    if not connection_id:
+        return False
+    with _policy_session_lock:
+        return _policy_session_key(device_id, connection_id, origin, capability) in _policy_session_grants
+
+
+def grant_policy_session(device_id: str, connection_id: str, origin: str, capability: str) -> None:
+    if not connection_id:
+        return
+    with _policy_session_lock:
+        _policy_session_grants.add(_policy_session_key(device_id, connection_id, origin, capability))
+
+
+def clear_connection_policy_grants(device_id: str, connection_id: str) -> int:
+    """Called from `Relay._drop()` when a connection closes -- the ONLY way
+    an `ask_per_session` grant ever goes away short of a gateway restart
+    (which clears `_policy_session_grants` for free, being in-memory).
+    Returns the number of grants cleared, purely for logging."""
+    if not connection_id:
+        return 0
+    with _policy_session_lock:
+        matching = [
+            key for key in _policy_session_grants
+            if key[0] == device_id and key[1] == connection_id
+        ]
+        for key in matching:
+            _policy_session_grants.discard(key)
+    if matching:
+        audit.record(
+            "policy_session_grants_cleared", device=device_id, connection=connection_id, count=len(matching),
+        )
+    return len(matching)
+
+
+def check_policy_grant(
+    device_id: str, origin: str, capability: str, mode: str, connection_id: str,
+) -> Optional["Decision"]:
+    """The EP1 policy short-circuit: is `require()`'s live prompt unnecessary
+    for this call, purely because of the device's reported approval policy?
+
+    Returns a ``Decision(allowed=True, scope="policy")`` when so, or ``None``
+    when a live prompt is still needed (the ordinary ``require()`` path
+    should run) -- this function NEVER returns a deny; policy is only ever a
+    way to skip a prompt that would otherwise happen, never an extra refusal
+    layer on top of the ordinary grant checks `_authorize` already ran.
+
+    The floor (ep1-contract.md): only consulted when `mode == "full"` -- a
+    `request`-mode origin prompts every call regardless of policy, so callers
+    must pass the caller's own already-computed `mode` rather than have this
+    function re-derive it (there is no origin-independent "the policy" to
+    check; `state.get_mode` needs the tool call's actual origin).
+    """
+    if mode != "full" or capability not in APPROVAL_POLICY_KEYS:
+        return None
+    policy = approval_policy(device_id, capability)
+    if policy == "always_allow":
+        return Decision(
+            allowed=True, reason=f"approval_policy={policy} for {capability} at {origin}", scope="policy",
+        )
+    if policy == "ask_per_session" and has_policy_session_grant(device_id, connection_id, origin, capability):
+        return Decision(
+            allowed=True,
+            reason=f"approval_policy={policy}: granted earlier this connection for {capability} at {origin}",
+            scope="policy",
+        )
+    return None
 
 # Capabilities whose prompt offers once/session but never "always": an
 # approval "always" promotes the whole origin to 'full', which would widen
@@ -460,7 +615,7 @@ def require(
     # `choice not in waiter.request.allowed_choices` check -- the same path
     # that already rejects a stale/replayed response -- so there is exactly
     # one place that validates what choices a given request will accept.
-    allow_standing = capability not in NO_STANDING_GRANT_CAPABILITIES
+    allow_standing = capability not in APPROVAL_POLICY_KEYS
     request = ApprovalRequest.create(
         command=f"browser_bridge_{capability} at {origin}",
         description=summary + (f" — {detail}" if detail else ""),
@@ -501,7 +656,10 @@ def require(
     return _apply_result(device_id, origin, capability, session_key, request.request_id, result)
 
 
-def has_standing_grant(device_id: str, session_key: str, origin: str, capability: str) -> bool:
+def has_standing_grant(
+    device_id: str, session_key: str, origin: str, capability: str,
+    mode: str = "", connection_id: str = "",
+) -> bool:
     """Public counterpart of `require()`'s own pre-checks (`_check_capability_grant`/
     `_check_session_grant`), exposed so a caller can ask "would `require()` skip the
     live prompt for this?" WITHOUT actually presenting one.
@@ -512,7 +670,15 @@ def has_standing_grant(device_id: str, session_key: str, origin: str, capability
     not when a standing 'always'/session grant already covers it. Never itself a
     substitute for `_authorize`/`require()`, which still run for real once a step
     executes.
+
+    EP1: also true when `check_policy_grant` would short-circuit the prompt --
+    an `always_allow` policy on a `full`-mode `origin`, or a live
+    `ask_per_session` connection grant. `mode`/`connection_id` default to ""
+    so a caller that doesn't pass them (the "commit" capability, which is not
+    in APPROVAL_POLICY_KEYS) behaves exactly as before this changed.
     """
+    if check_policy_grant(device_id, origin, capability, mode, connection_id) is not None:
+        return True
     if _check_capability_grant(device_id, origin, capability) is not None:
         return True
     if session_key and _check_session_grant(device_id, session_key, origin, capability) is not None:
@@ -573,11 +739,11 @@ def _apply_result(
         # "revoke this later" hook per plugin-api-findings.md, so an
         # unbounded standing grant would outlive the user's intent to give
         # it). `require()` already refused to offer this choice at all for
-        # NO_STANDING_GRANT_CAPABILITIES, so reaching here with one of those
+        # APPROVAL_POLICY_KEYS, so reaching here with one of those
         # would mean the host's own allowed_choices validation was bypassed
         # -- treat that as a bug worth surfacing, not something to special-
         # case quietly.
-        assert capability not in NO_STANDING_GRANT_CAPABILITIES, (
+        assert capability not in APPROVAL_POLICY_KEYS, (
             f"host allowed an 'always' choice for {capability!r}, which require() built with "
             f"allow_permanent=False -- resolve()'s allowed_choices check should have rejected this"
         )
@@ -620,7 +786,7 @@ def _check_capability_grant(device_id: str, origin: str, capability: str) -> Opt
     ever writing to that table."""
     if capability not in DANGEROUS_CAPABILITIES:
         return None
-    if capability in NO_STANDING_GRANT_CAPABILITIES:
+    if capability in APPROVAL_POLICY_KEYS:
         # The write side already refuses to create one of these (require()
         # builds the ApprovalRequest with allow_permanent=False, and the
         # host's own allowed_choices validation rejects an "always" that
@@ -646,7 +812,7 @@ def _check_capability_grant(device_id: str, origin: str, capability: str) -> Opt
 def _check_session_grant(device_id: str, session_key: str, origin: str, capability: str) -> Optional[Decision]:
     if not session_key:
         return None
-    if capability in NO_STANDING_GRANT_CAPABILITIES:
+    if capability in APPROVAL_POLICY_KEYS:
         # Same reasoning as _check_capability_grant's own exclusion: a
         # capability that may never hold a standing grant must not be granted
         # one by a row that already exists, whatever put it there.

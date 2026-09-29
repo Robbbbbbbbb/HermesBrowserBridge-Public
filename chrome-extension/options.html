@@ -152,6 +152,18 @@
         <input id="allowFileUploadFromAgent" type="checkbox" />
         <label for="allowFileUploadFromAgent">Upload agent-supplied bytes &mdash; let the agent hand over file contents directly (no local path involved), capped at Max upload size below</label>
       </div>
+      <div class="field approval-policy">
+        <label for="uploadApproval">Upload approval prompt</label>
+        <select id="uploadApproval">
+          <option value="always_allow">Always allow (no prompt, every call audited)</option>
+          <option value="ask_per_session">Ask once per connection</option>
+          <option value="always_ask">Ask every time</option>
+        </select>
+        <p class="hint-inline">
+          Only takes effect once uploading is switched on above, and only on a site set to Full access
+          &mdash; a site set to Request still asks every time no matter what you pick here.
+        </p>
+      </div>
       <div class="check">
         <input id="allowDialogDismiss" type="checkbox" />
         <label for="allowDialogDismiss">Dismiss dialogs &mdash; let the agent close/cancel a JS alert, confirm, prompt or beforeunload dialog. Never accepts one, only ever the safe direction</label>
@@ -162,7 +174,19 @@
       </div>
       <div class="check">
         <input id="allowEvaluate" type="checkbox" />
-        <label for="allowEvaluate">Run JavaScript &mdash; let the agent evaluate an arbitrary expression in the page. The single most powerful toggle on this page &mdash; every call is audited verbatim</label>
+        <label for="allowEvaluate">Run JavaScript &mdash; let the agent evaluate an arbitrary expression in the page. The single most powerful toggle on this page &mdash; on by default on a new install; every call is audited verbatim</label>
+      </div>
+      <div class="field approval-policy">
+        <label for="evaluateApproval">Run JavaScript approval prompt</label>
+        <select id="evaluateApproval">
+          <option value="always_allow">Always allow (no prompt, every call audited)</option>
+          <option value="ask_per_session">Ask once per connection</option>
+          <option value="always_ask">Ask every time</option>
+        </select>
+        <p class="hint-inline">
+          Only takes effect once Run JavaScript is switched on above, and only on a site set to Full
+          access &mdash; a site set to Request still asks every time no matter what you pick here.
+        </p>
       </div>
       <div class="check">
         <input id="allowConsoleRead" type="checkbox" />
@@ -175,6 +199,18 @@
       <div class="check">
         <input id="allowHttpAuth" type="checkbox" />
         <label for="allowHttpAuth">Read HTTP auth status &mdash; let the agent see whether a tab is showing an HTTP auth challenge. Read-only: actually arming credentials stays a user-only action</label>
+      </div>
+      <div class="field approval-policy">
+        <label for="httpAuthApproval">HTTP auth approval prompt</label>
+        <select id="httpAuthApproval">
+          <option value="always_allow">Always allow (no prompt, every call audited)</option>
+          <option value="ask_per_session">Ask once per connection</option>
+          <option value="always_ask">Ask every time</option>
+        </select>
+        <p class="hint-inline">
+          Only takes effect once Read HTTP auth status is switched on above, and only on a site set to
+          Full access &mdash; a site set to Request still asks every time no matter what you pick here.
+        </p>
       </div>
       <div class="check">
         <input id="allowDownloadsRead" type="checkbox" />

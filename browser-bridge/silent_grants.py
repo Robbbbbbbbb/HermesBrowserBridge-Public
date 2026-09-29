@@ -442,25 +442,45 @@ def authorize_silent_fetch(
     method = (method or "GET").strip().upper() or "GET"
     origin = origins_mod.canonicalize_origin(tools_mod._origin_of(url))
 
+    resolution = resolve_silent_origin(device_id, origin)
+    if resolution == "grant_off":
+        return _refuse_not_granted(device_id, origin, method, url, "the origin's access mode is 'off'")
+    if resolution == "silent_off":
+        return _refuse_not_granted(device_id, origin, method, url, "the origin's 'Background requests' setting is 'off'")
+    if resolution == "zero_touch":
+        return None
+    return _ask_once(device_id, origin, method, url, session_key, summary, detail)
+
+
+def resolve_silent_origin(device_id: str, origin: str) -> str:
+    """The SF4.2 resolution, without any prompting or auditing. Returns one of
+    ``"grant_off"`` (the origin's ordinary access mode is off),
+    ``"silent_off"`` (its 'Background requests' setting is off),
+    ``"zero_touch"`` (an explicit 'always', or no override and 'full' +
+    ``full_implies_silent``) or ``"ask"`` (an explicit 'ask', or no override
+    and anything else). ``authorize_silent_fetch`` and EP2's
+    ``silent_evaluate`` both decide through this one function so the two
+    lanes can never resolve the same origin differently.
+    """
     grant_mode = state.get_mode(device_id, origin)
     if grant_mode == "off":
-        return _refuse_not_granted(device_id, origin, method, url, "the origin's access mode is 'off'")
+        return "grant_off"
 
     silent_mode = state.get_origin_silent_mode(device_id, origin)
     if silent_mode == "off":
-        return _refuse_not_granted(device_id, origin, method, url, "the origin's 'Background requests' setting is 'off'")
+        return "silent_off"
     if silent_mode == "always":
-        return None
+        return "zero_touch"
     if silent_mode == "ask":
-        return _ask_once(device_id, origin, method, url, session_key, summary, detail)
+        return "ask"
 
     # No explicit per-origin override on record (silent_mode is None) — the
     # plugin-wide default. grant_mode here is 'request' or 'full' (the only
     # two values left once 'off' was handled above).
     cfg = silent_fetch_config()
     if grant_mode == "full" and cfg["full_implies_silent"]:
-        return None
-    return _ask_once(device_id, origin, method, url, session_key, summary, detail)
+        return "zero_touch"
+    return "ask"
 
 
 # -- SF4.4: rate guard + per-origin serialization ------------------------------
@@ -594,6 +614,119 @@ def silent_rate_guard(
     return reason, protocol.SILENT_RATE_LIMITED, retry_after
 
 
+class SilentWorkerBusy(Exception):
+    """A silent call was refused because the origin's hidden worker is already
+    running another silent call in a way that must not queue (see
+    ``origin_slot`` / ``eval_origin_slot``). Maps to SILENT_WORKER_BUSY (4265)."""
+
+
+# Which kind of silent call ("fetch" | "eval") currently holds each
+# (device, origin) slot. Guarded by _holders_lock; an entry exists only while
+# the slot is held, so the dict cannot grow without bound.
+_holders_lock = threading.Lock()
+_slot_holders: Dict[Tuple[str, str], str] = {}
+
+
+def _set_holder(key: Tuple[str, str], kind: str) -> None:
+    with _holders_lock:
+        _slot_holders[key] = kind
+
+
+def _clear_holder(key: Tuple[str, str]) -> None:
+    with _holders_lock:
+        _slot_holders.pop(key, None)
+
+
+def _holder(key: Tuple[str, str]) -> Optional[str]:
+    with _holders_lock:
+        return _slot_holders.get(key)
+
+
+def silent_slot_holder(device_id: str, origin: str) -> Optional[str]:
+    """``"fetch"``, ``"eval"`` or None: what currently holds the origin's slot."""
+    return _holder((device_id, origin))
+
+
+# -- worker reclaim (silent.kill) ----------------------------------------------
+
+# How long a reclaim may block the calling tool/CLI thread. The kill is
+# best-effort: the send runs on a helper thread and we stop waiting for it
+# after this long, so a wedged relay can never hold up a tool result.
+RECLAIM_WAIT_S = 2.0
+
+RECLAIM_TRIGGERS = ("relay_timeout", "orphaned_busy", "operator", "agent")
+
+
+def reclaim_worker(
+    device_id: str,
+    origin: Optional[str],
+    *,
+    trigger: str,
+    method: str = "",
+    relay: Any = None,
+) -> Dict[str, Any]:
+    """Best-effort ``silent.kill {origin}`` to ``device_id`` (``origin`` None or
+    empty kills every worker on that device), audited as
+    ``silent_worker_reclaim``. NEVER raises and never blocks longer than
+    ``RECLAIM_WAIT_S``.
+
+    Why this exists: when the gateway gives up on a ``silent.fetch`` /
+    ``silent.evaluate`` (relay TIMEOUT) the extension's worker may still be
+    marked busy, and nothing else tells it to let go -- every later call to
+    that origin would then be refused SILENT_WORKER_BUSY (4265) until the
+    extension's own watchdog fires (15+ minutes observed live).
+
+    Returns ``{"sent": bool, "killed": list|None, "error": str|None}``;
+    ``sent`` is True only when the extension acknowledged within the wait.
+    """
+    outcome: Dict[str, Any] = {"sent": False, "killed": None, "error": None}
+    try:
+        if relay is None:
+            from . import relay as relay_mod  # noqa: PLC0415 - avoid an import cycle at module load
+
+            relay = relay_mod.get_relay()
+        if relay is None:
+            outcome["error"] = "relay is not running in this process"
+        else:
+            params: Dict[str, Any] = {"origin": origin} if origin else {}
+            box: Dict[str, Any] = {}
+
+            def _send() -> None:
+                try:
+                    box["result"] = relay.call(device_id, "silent.kill", params, timeout=RECLAIM_WAIT_S)
+                except BaseException as exc:  # noqa: BLE001 - best-effort, reported below
+                    box["error"] = str(exc) or type(exc).__name__
+
+            thread = threading.Thread(target=_send, name="bridge-silent-reclaim", daemon=True)
+            thread.start()
+            thread.join(RECLAIM_WAIT_S)
+            if thread.is_alive():
+                outcome["error"] = f"no acknowledgement within {RECLAIM_WAIT_S}s"
+            elif "error" in box:
+                outcome["error"] = box["error"]
+            else:
+                outcome["sent"] = True
+                result = box.get("result")
+                if isinstance(result, dict) and isinstance(result.get("killed"), list):
+                    outcome["killed"] = [str(o) for o in result["killed"]]
+    except BaseException as exc:  # noqa: BLE001 - must never raise into a tool result
+        outcome["error"] = str(exc) or type(exc).__name__
+    try:
+        audit.record(
+            "silent_worker_reclaim", device=device_id, origin=origin or "*", trigger=trigger,
+            method=method, sent=bool(outcome["sent"]),
+            **({"error": outcome["error"]} if outcome["error"] else {}),
+        )
+    except Exception:  # pragma: no cover - auditing must not break a tool result
+        logger.debug("silent_worker_reclaim audit failed", exc_info=True)
+    return outcome
+
+
+def slot_in_flight(device_id: str, origin: str) -> bool:
+    """True when a gateway-side silent call currently holds the origin's slot."""
+    return _holder((device_id, origin)) is not None
+
+
 @contextmanager
 def origin_slot(device_id: str, origin: str, timeout_s: float = 30.0) -> Iterator[None]:
     """SF4.4 per-(device, origin) serialization: a queue/lock the tool
@@ -604,6 +737,12 @@ def origin_slot(device_id: str, origin: str, timeout_s: float = 30.0) -> Iterato
     contend — each gets its own lock from ``_origin_locks`` — so parallelism
     across origins is unaffected.
 
+    Fetch-vs-fetch still WAITS for the slot. But a silent EVALUATE holding it
+    is single-flight on the extension side (SILENT_WORKER_BUSY, rejected not
+    queued), so a fetch arriving while an evaluation holds the slot raises
+    ``SilentWorkerBusy`` immediately instead of waiting out a run that may last
+    minutes.
+
     Raises ``TimeoutError`` if the slot is still held by another call after
     ``timeout_s`` — the caller (SF5's tool handler) turns that into an
     honest refusal rather than blocking the gateway worker thread forever
@@ -611,13 +750,46 @@ def origin_slot(device_id: str, origin: str, timeout_s: float = 30.0) -> Iterato
     """
     key = (device_id, origin)
     lock: threading.Lock = _origin_locks.get_or_create(key, threading.Lock)
-    acquired = lock.acquire(timeout=timeout_s)
-    if not acquired:
-        raise TimeoutError(
-            f"timed out after {timeout_s}s waiting for the silent-fetch queue slot for {origin!r} on "
-            f"device {device_id!r} (another silent fetch to this same origin is still in flight)"
-        )
+    deadline = time.monotonic() + timeout_s
+    while True:
+        if _holder(key) == "eval":
+            raise SilentWorkerBusy(
+                f"a silent evaluation is still running on the worker for {origin!r} (device {device_id!r})"
+            )
+        remaining = deadline - time.monotonic()
+        if lock.acquire(timeout=max(0.0, min(0.05, remaining))):
+            break
+        if remaining <= 0:
+            raise TimeoutError(
+                f"timed out after {timeout_s}s waiting for the silent-fetch queue slot for {origin!r} on "
+                f"device {device_id!r} (another silent fetch to this same origin is still in flight)"
+            )
+    _set_holder(key, "fetch")
     try:
         yield
     finally:
+        _clear_holder(key)
+        lock.release()
+
+
+@contextmanager
+def eval_origin_slot(device_id: str, origin: str) -> Iterator[None]:
+    """Slot for a silent EVALUATE: never waits. If ANY silent call (fetch or
+    evaluate) holds the origin's slot, raise ``SilentWorkerBusy`` at once; the
+    caller refuses with SILENT_WORKER_BUSY (4265) without touching the relay.
+    The slot is marked as held by an evaluation until the block exits (always
+    released in ``finally``), which is what makes a concurrent fetch refuse
+    immediately too."""
+    key = (device_id, origin)
+    lock: threading.Lock = _origin_locks.get_or_create(key, threading.Lock)
+    if not lock.acquire(blocking=False):
+        raise SilentWorkerBusy(
+            f"another silent call ({_holder(key) or 'fetch or evaluation'}) is still running on the worker for "
+            f"{origin!r} (device {device_id!r})"
+        )
+    _set_holder(key, "eval")
+    try:
+        yield
+    finally:
+        _clear_holder(key)
         lock.release()

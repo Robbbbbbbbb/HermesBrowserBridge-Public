@@ -1,9 +1,10 @@
 import { E as ERROR_CODES, f as formatRefusal } from "./chunks/refusals.js";
-import { a as attachabilityOf, d as describeAttachFailure, i as isForeignExtensionRefusal, f as foreignExtensionIds, p as preloadedPageHint, s as summariseFrameRefs, u as unreportedParentCount, r as redactText, g as getReplayStore, b as redactCaption, R as REDACT_THEN_TRUNCATE_PREFIX_MULTIPLIER, c as secretRedactionMarker, t as trimTrailingPartialToken, e as redactThenTruncate, h as redactSecrets } from "./chunks/replay-store.js";
+import { a as attachabilityOf, d as describeAttachFailure, i as isForeignExtensionRefusal, f as foreignExtensionIds, p as preloadedPageHint, s as summariseFrameRefs, u as unreportedParentCount, r as redactText, g as getReplayStore, b as redactCaption, c as redactThenTruncate, e as redactSecrets, R as REDACT_THEN_TRUNCATE_PREFIX_MULTIPLIER, h as secretRedactionMarker, t as trimTrailingPartialToken } from "./chunks/replay-store.js";
 import { g as getSettings, s as setSettings, p as powerPolicyOf, r as redactionPolicyOf, a as getOriginSilentModes, c as clearCredentials, b as setCredentials, d as getCredentials } from "./chunks/storage.js";
 import { s as send } from "./chunks/messages.js";
 const SILENT_WORKER_LAUNCH_FAILED = ERROR_CODES.SILENT_WORKER_LAUNCH_FAILED;
 const SILENT_WORKER_KILLED = ERROR_CODES.SILENT_WORKER_KILLED;
+const SILENT_WORKER_BUSY = ERROR_CODES.SILENT_WORKER_BUSY;
 const POOL_WINDOW_TITLE = "Hermes Browser Bridge — background";
 const POOL_GROUP_TITLE = "Hermes background";
 const DEFAULT_MAX_WORKERS = 5;
@@ -14,6 +15,12 @@ const MAX_BOOTSTRAP_TIMEOUT_MS = 12e4;
 let launchTimeoutMs = DEFAULT_BOOTSTRAP_TIMEOUT_MS;
 function clampBootstrapTimeoutMs(ms) {
   return Math.min(MAX_BOOTSTRAP_TIMEOUT_MS, Math.max(MIN_BOOTSTRAP_TIMEOUT_MS, Math.floor(ms)));
+}
+const BUSY_LEASE_GRACE_MS = 3e4;
+const DEFAULT_LEASE_MS = 10 * 60 * 1e3;
+const CLOSE_TAB_BOUND_MS = 2e3;
+function leaseExpired(worker, now) {
+  return worker.state === "busy" && typeof worker.leaseUntil === "number" && now > worker.leaseUntil + BUSY_LEASE_GRACE_MS;
 }
 class SilentPoolError extends Error {
   code;
@@ -28,6 +35,20 @@ class SilentPoolError extends Error {
 let poolWindowId;
 const workers = /* @__PURE__ */ new Map();
 const inFlightByOrigin = /* @__PURE__ */ new Map();
+const inFlightKind = /* @__PURE__ */ new Map();
+const launchingByOrigin = /* @__PURE__ */ new Map();
+const teardownListeners = /* @__PURE__ */ new Set();
+function onWorkerTeardown(listener) {
+  teardownListeners.add(listener);
+}
+function fireTeardown(tabId, origin) {
+  for (const listener of teardownListeners) {
+    try {
+      listener(tabId, origin);
+    } catch {
+    }
+  }
+}
 let maxWorkers = DEFAULT_MAX_WORKERS;
 let workerTtlMs = DEFAULT_WORKER_TTL_MS;
 let adoptPromise;
@@ -138,6 +159,17 @@ async function doAdopt() {
       }
     }
   }
+  try {
+    const targets = await chrome.debugger.getTargets();
+    const poolTabs = new Set([...workers.values()].map((w) => w.tabId));
+    for (const target of targets) {
+      if (target.attached && typeof target.tabId === "number" && poolTabs.has(target.tabId)) {
+        await chrome.debugger.detach({ tabId: target.tabId }).catch(() => {
+        });
+      }
+    }
+  } catch {
+  }
   registerSweepAlarm();
   await persistState();
 }
@@ -157,6 +189,9 @@ if (typeof chrome !== "undefined" && chrome.alarms?.onAlarm?.addListener) {
 async function sweepExpiredWorkers(now = Date.now) {
   await ensureAdopted();
   const cutoff = now() - workerTtlMs;
+  for (const worker of [...workers.values()]) {
+    if (leaseExpired(worker, now())) await recycleWorker(worker.origin, "recycle", "busy_expired", now);
+  }
   for (const worker of [...workers.values()]) {
     if (worker.state !== "idle") continue;
     const reason = await driftReason(worker);
@@ -512,9 +547,20 @@ async function launchWorker(origin, bootstrapPath, bootstrapTimeoutMsOverride, n
   return { origin, tabId, windowId, createdAt, lastUsed: createdAt, served: 0, state: "idle" };
 }
 async function closeTabQuietly(tabId) {
+  let timer;
   try {
-    await chrome.tabs.remove(tabId);
+    const removal = Promise.resolve(chrome.tabs.remove(tabId));
+    removal.catch(() => {
+    });
+    await Promise.race([
+      removal,
+      new Promise((resolve) => {
+        timer = setTimeout(resolve, CLOSE_TAB_BOUND_MS);
+      })
+    ]);
   } catch {
+  } finally {
+    clearTimeout(timer);
   }
 }
 function describeError$1(error) {
@@ -538,6 +584,7 @@ async function recycleWorker(origin, action, reason, now = Date.now) {
   workers.delete(origin);
   rejectInFlight(origin, SILENT_WORKER_KILLED);
   notifySilentWorker(origin, action, { reason, served: worker.served, ageMs: Math.max(0, now() - worker.createdAt) });
+  fireTeardown(worker.tabId, origin);
   await closeTabQuietly(worker.tabId);
   await persistState();
 }
@@ -562,6 +609,17 @@ async function driftReason(worker) {
 }
 async function acquireWorker(origin, opts = {}, now = Date.now) {
   await ensureAdopted();
+  const kind = opts.kind ?? "fetch";
+  const leaseMs = typeof opts.leaseMs === "number" && Number.isFinite(opts.leaseMs) && opts.leaseMs > 0 ? opts.leaseMs : DEFAULT_LEASE_MS;
+  const stale = workers.get(origin);
+  if (stale && leaseExpired(stale, now())) await recycleWorker(origin, "recycle", "busy_expired", now);
+  const busyError = () => new SilentPoolError(
+    SILENT_WORKER_BUSY,
+    `the background worker for ${origin} is already running a silent request; wait for it to finish and retry`
+  );
+  const conflicts = (holder) => holder !== void 0 && (kind === "eval" || holder === "eval");
+  const busyNow = (w) => !!w && w.state === "busy" && conflicts(w.busyKind);
+  if (busyNow(workers.get(origin)) || conflicts(launchingByOrigin.get(origin))) throw busyError();
   let worker = workers.get(origin);
   if (worker) {
     const reason = await driftReason(worker);
@@ -570,16 +628,30 @@ async function acquireWorker(origin, opts = {}, now = Date.now) {
       worker = void 0;
     }
   }
+  if (worker && busyNow(worker)) throw busyError();
+  let launched = false;
   if (!worker) {
+    if (conflicts(launchingByOrigin.get(origin))) throw busyError();
     if (workers.size >= maxWorkers && !workers.has(origin)) {
       const lru = pickLruIdleWorker();
       if (lru) await recycleWorker(lru.origin, "evict", "lru", now);
     }
-    worker = await launchWorker(origin, opts.bootstrapPath, opts.bootstrapTimeoutMs, now);
+    if (conflicts(launchingByOrigin.get(origin)) || busyNow(workers.get(origin))) throw busyError();
+    launchingByOrigin.set(origin, kind);
+    try {
+      worker = await launchWorker(origin, opts.bootstrapPath, opts.bootstrapTimeoutMs, now);
+    } finally {
+      launchingByOrigin.delete(origin);
+    }
     workers.set(origin, worker);
+    launched = true;
     await persistState();
   }
+  if (worker.state !== "busy") worker.busySince = now();
+  worker.leaseUntil = Math.max(worker.leaseUntil ?? 0, now() + leaseMs);
   worker.state = "busy";
+  worker.active = (worker.active ?? 0) + 1;
+  worker.busyKind = kind === "eval" || worker.busyKind === "eval" ? "eval" : "fetch";
   worker.lastUsed = now();
   await persistState();
   let released = false;
@@ -587,12 +659,19 @@ async function acquireWorker(origin, opts = {}, now = Date.now) {
   return {
     tabId,
     origin,
+    launched,
     release: () => {
       if (released) return;
       released = true;
       const current = workers.get(origin);
       if (current && current.tabId === tabId) {
-        current.state = "idle";
+        current.active = Math.max(0, (current.active ?? 1) - 1);
+        if (current.active === 0) {
+          current.state = "idle";
+          current.busyKind = void 0;
+          current.busySince = void 0;
+          current.leaseUntil = void 0;
+        }
         current.served += 1;
         current.lastUsed = now();
         void persistState();
@@ -600,16 +679,44 @@ async function acquireWorker(origin, opts = {}, now = Date.now) {
     }
   };
 }
-function registerInFlight(origin, abort) {
+async function recycleAfterEvalWedge(origin, now = Date.now) {
+  const worker = workers.get(origin);
+  if (worker) notifySilentWorker(origin, "eval_wedge", { reason: "eval_timeout", served: worker.served, ageMs: Math.max(0, now() - worker.createdAt) });
+  await recycleWorker(origin, "recycle", "eval_wedge", now);
+}
+async function recycleAfterFetchWedge(origin, now = Date.now) {
+  await recycleWorker(origin, "recycle", "fetch_wedge", now);
+}
+function registerInFlight(origin, abort, kind = "fetch") {
   let set = inFlightByOrigin.get(origin);
   if (!set) inFlightByOrigin.set(origin, set = /* @__PURE__ */ new Set());
   set.add(abort);
+  inFlightKind.set(abort, kind);
   return () => {
+    inFlightKind.delete(abort);
     const current = inFlightByOrigin.get(origin);
     if (!current) return;
     current.delete(abort);
     if (current.size === 0) inFlightByOrigin.delete(origin);
   };
+}
+async function abortInFlightEvals(code) {
+  const origins = [];
+  let aborted = 0;
+  for (const [origin, set] of inFlightByOrigin) {
+    let hit = false;
+    for (const abort of [...set]) {
+      if (inFlightKind.get(abort) !== "eval") continue;
+      abort(code);
+      aborted += 1;
+      hit = true;
+    }
+    if (hit) origins.push(origin);
+  }
+  for (const origin of origins) {
+    await killWorkers(origin, "stop_button");
+  }
+  return aborted;
 }
 async function killWorkers(origin, reason = "user_kill") {
   await ensureAdopted();
@@ -664,6 +771,7 @@ if (typeof chrome !== "undefined" && chrome.tabs?.onRemoved?.addListener) {
       if (worker.tabId !== tabId) continue;
       workers.delete(origin);
       rejectInFlight(origin, SILENT_WORKER_KILLED);
+      fireTeardown(worker.tabId, origin);
       notifySilentWorker(origin, "closed", {
         reason: "user_closed",
         served: worker.served,
@@ -801,7 +909,7 @@ async function pausedNow() {
     return false;
   }
 }
-const CDP_PROTOCOL_VERSION = "1.3";
+const CDP_PROTOCOL_VERSION$1 = "1.3";
 const DESIRED_ATTACH_KEY = "cdp.desiredAttach";
 const LIMITED_ATTACH_KEY = "cdp.limitedAttach";
 const UPGRADE_RETRY_INTERVAL_MS = 5e3;
@@ -961,7 +1069,7 @@ async function attemptStripAndAttach(tabId, frames) {
   let attached = false;
   let allRestored = true;
   try {
-    await chrome.debugger.attach({ tabId }, CDP_PROTOCOL_VERSION);
+    await chrome.debugger.attach({ tabId }, CDP_PROTOCOL_VERSION$1);
     attached = true;
   } catch {
     attached = false;
@@ -1403,7 +1511,7 @@ class CdpManager {
     for (let attempt = 1; attempt <= MAX_FOREIGN_FRAME_ATTACH_ATTEMPTS; attempt++) {
       attemptsUsed = attempt;
       try {
-        await chrome.debugger.attach({ tabId }, CDP_PROTOCOL_VERSION);
+        await chrome.debugger.attach({ tabId }, CDP_PROTOCOL_VERSION$1);
         attached = true;
         break;
       } catch (error) {
@@ -1565,7 +1673,7 @@ class CdpManager {
   async liveAttachedTabIds() {
     try {
       const live = await chrome.debugger.getTargets();
-      return live.filter((t) => t.attached && typeof t.tabId === "number").map((t) => t.tabId);
+      return live.filter((t) => t.attached && typeof t.tabId === "number" && !isPoolTab(t.tabId)).map((t) => t.tabId);
     } catch {
       return [];
     }
@@ -1617,6 +1725,8 @@ class CdpManager {
     } catch {
       live = [];
     }
+    await getPoolWindowId().catch(() => void 0);
+    live = live.filter((target) => typeof target.tabId !== "number" || !isPoolTab(target.tabId));
     const adopted = [];
     for (const target of live) {
       if (target.attached && typeof target.tabId === "number") {
@@ -2526,6 +2636,10 @@ async function handleStopPressed(now = Date.now) {
   await setSettings({ paused: true, pauseReason: "stop-button", pausedAt: now() });
   await send({ target: "offscreen", type: "stoppedFromPage" });
   const released = await cdp.releaseAll();
+  try {
+    await abortInFlightEvals(ERROR_CODES.SHARING_PAUSED);
+  } catch {
+  }
   return { released };
 }
 const STOP_COMMAND = "stop-hermes";
@@ -2684,6 +2798,7 @@ function growSpan(start, length, limit) {
 const CAPABILITY_POWER_KEYS = {
   upload: ["allowFileUpload", "allowFileUploadFromAgent"],
   evaluate: ["allowEvaluate"],
+  silent_evaluate: ["allowEvaluate"],
   console: ["allowConsoleRead"],
   cookies_write: ["allowCookieWrite"],
   http_auth: ["allowHttpAuth"],
@@ -5622,7 +5737,7 @@ async function pageFetchImpl(args) {
 function isFailure$1(value) {
   return Boolean(value) && value.__hermesFetchError === true;
 }
-function validateUrl$1(url) {
+function validateUrl$2(url) {
   let parsed;
   try {
     parsed = new URL(url);
@@ -5641,7 +5756,7 @@ async function handlePageFetch(msg) {
   if (!msg.url) {
     return { ok: false, code: ERROR_CODES.INVALID_PARAMS, error: "page.fetch requires a url" };
   }
-  const urlError = validateUrl$1(msg.url);
+  const urlError = validateUrl$2(msg.url);
   if (urlError) {
     return { ok: false, code: ERROR_CODES.INVALID_PARAMS, error: urlError };
   }
@@ -5686,7 +5801,158 @@ async function handlePageFetch(msg) {
     }
   };
 }
-const DEFAULT_TIMEOUT_MS$1 = 3e4;
+const WALL_CLOCK_GRACE_MS = 500;
+async function raceWallClock(work, timeoutMs, interrupt) {
+  let timer;
+  const timeoutPromise = new Promise((resolve) => {
+    timer = setTimeout(() => resolve({ kind: "timeout" }), Math.max(0, timeoutMs) + WALL_CLOCK_GRACE_MS);
+  });
+  const racers = [
+    work.then((value) => ({ kind: "done", value })),
+    timeoutPromise
+  ];
+  if (interrupt) racers.push(interrupt.then((value) => ({ kind: "interrupted", value })));
+  try {
+    return await Promise.race(racers);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+async function interruptibleSleep(ms, interrupt) {
+  let timer;
+  const slept = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(false), Math.max(0, ms));
+  });
+  try {
+    return await Promise.race([slept, interrupt.then(() => true)]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+const MAX_EXPRESSION_CHARS = 4096;
+const MAX_RESULT_CHARS = 32 * 1024;
+const DEFAULT_TIMEOUT_MS$1 = 1e4;
+const MAX_TIMEOUT_MS = 3e4;
+function clampTimeout(requested) {
+  const value = typeof requested === "number" && requested > 0 ? requested : DEFAULT_TIMEOUT_MS$1;
+  return Math.min(value, MAX_TIMEOUT_MS);
+}
+function terminateBestEffort(tabId) {
+  void cdp.send(tabId, "Runtime.terminateExecution", {}).catch(() => {
+  });
+}
+function previewOf(remote) {
+  if (!remote) return { text: "undefined" };
+  if ("unserializableValue" in remote && remote.unserializableValue !== void 0) {
+    return { text: String(remote.unserializableValue), type: remote.type, subtype: remote.subtype };
+  }
+  if ("value" in remote) {
+    const value = remote.value;
+    if (value === null) return { text: "null", type: remote.type, subtype: remote.subtype };
+    if (typeof value === "string") return { text: value, type: remote.type, subtype: remote.subtype };
+    try {
+      return { text: JSON.stringify(value), type: remote.type, subtype: remote.subtype };
+    } catch {
+      return { text: String(value), type: remote.type, subtype: remote.subtype };
+    }
+  }
+  if (typeof remote.description === "string" && remote.description) {
+    return { text: remote.description, type: remote.type, subtype: remote.subtype };
+  }
+  return { text: remote.type ? `<${remote.type}>` : "<value>", type: remote.type, subtype: remote.subtype };
+}
+async function handlePageEvaluate(msg) {
+  const settings = await getSettings();
+  const denial = await assertEvaluateAllowed(settings);
+  if (denial) {
+    return { ok: false, code: denial.code, error: denial.message };
+  }
+  const limitedRefusal = cdpOnlyGate(msg.tabId, "evaluate");
+  if (limitedRefusal) {
+    return { ok: false, code: limitedRefusal.code, error: limitedRefusal.message };
+  }
+  const expression = typeof msg.expression === "string" ? msg.expression : "";
+  if (!expression) {
+    return { ok: false, code: ERROR_CODES.INVALID_PARAMS, error: "page.evaluate requires a non-empty expression" };
+  }
+  if (expression.length > MAX_EXPRESSION_CHARS) {
+    return {
+      ok: false,
+      code: ERROR_CODES.EVAL_EXPRESSION_TOO_LARGE,
+      error: `expression is ${expression.length} chars, over the ${MAX_EXPRESSION_CHARS}-char cap`
+    };
+  }
+  const world = msg.world ?? "main";
+  if (world !== "main") {
+    return {
+      ok: false,
+      code: ERROR_CODES.EVAL_WORLD_UNSUPPORTED,
+      error: `world '${world}' is not supported; only 'main' ships today (see docs/security.md §20)`
+    };
+  }
+  const timeoutMs = clampTimeout(msg.timeoutMs);
+  const awaitPromise = msg.awaitPromise ?? true;
+  let resolveCancelled;
+  const cancelHandle = registerCancellable(msg.tabId, "evaluate", (reason) => {
+    terminateBestEffort(msg.tabId);
+    resolveCancelled?.(reason);
+  });
+  const attempt = cdp.send(msg.tabId, "Runtime.evaluate", {
+    expression,
+    returnByValue: true,
+    // always true on the wire — see file header
+    awaitPromise,
+    timeout: timeoutMs,
+    // CDP-native bound; see file header for why it isn't sufficient alone
+    userGesture: false
+  });
+  const cancelPromise = new Promise((resolve) => {
+    resolveCancelled = resolve;
+  });
+  let raced;
+  try {
+    raced = await raceWallClock(attempt, timeoutMs, cancelPromise);
+  } finally {
+    cancelHandle.unregister();
+  }
+  const outcome = raced.kind === "done" ? { kind: "sent", sent: raced.value } : raced.kind === "interrupted" ? { kind: "cancelled", reason: raced.value } : { kind: "timeout" };
+  if (outcome.kind === "cancelled") {
+    return {
+      ok: false,
+      code: codeForCancelReason(outcome.reason),
+      error: `evaluate was cancelled (${outcome.reason}) before it finished; Runtime.terminateExecution was requested best-effort on tab ${msg.tabId} — the expression may still be running if a dialog or a frozen main thread kept the termination itself from taking effect`
+    };
+  }
+  if (outcome.kind === "timeout") {
+    terminateBestEffort(msg.tabId);
+    return {
+      ok: false,
+      code: ERROR_CODES.TIMEOUT,
+      error: `evaluate exceeded its ${timeoutMs}ms timeout; the expression may still be running in the page (a dialog it opened, an infinite loop, or a pending promise) — this call gave up waiting rather than hang every subsequent browser_bridge_* call on tab ${msg.tabId}`
+    };
+  }
+  const sent = outcome.sent;
+  if (!sent.ok) {
+    return { ok: false, code: sent.error.code, error: sent.error.message };
+  }
+  if (sent.result.exceptionDetails) {
+    const detail = sent.result.exceptionDetails.exception?.description ?? sent.result.exceptionDetails.text ?? "evaluate threw";
+    return { ok: false, code: ERROR_CODES.CDP_ERROR, error: detail };
+  }
+  const preview = previewOf(sent.result.result);
+  const policy = redactionPolicyOf(settings);
+  const { text: redacted, truncated } = redactThenTruncate(preview.text, MAX_RESULT_CHARS, policy);
+  return {
+    ok: true,
+    data: {
+      result: redacted,
+      resultType: preview.type,
+      resultSubtype: preview.subtype,
+      truncated
+    }
+  };
+}
+const DEFAULT_TIMEOUT_MS = 3e4;
 const DEFAULT_MAX_BYTES = 2 * 1024 * 1024;
 const HARD_CAP_BYTES = 16 * 1024 * 1024;
 let effectiveMaxBodyBytes = HARD_CAP_BYTES;
@@ -5740,7 +6006,7 @@ async function pageSilentFetchImpl(args) {
   }
   progress.fetchNative = fetchFn.toString().includes("[native code]");
   try {
-    let toBase64 = function(bytes) {
+    let toBase642 = function(bytes) {
       let binary = "";
       for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i]);
       return btoa(binary);
@@ -5850,7 +6116,7 @@ async function pageSilentFetchImpl(args) {
         inlineBody = bodyText;
         bodyEncoding = "utf-8";
       } else {
-        inlineBody = toBase64(capturedBytes);
+        inlineBody = toBase642(capturedBytes);
         bodyEncoding = "base64";
       }
     } else {
@@ -5972,7 +6238,7 @@ function isFailure(value) {
 function isSliceMissing(value) {
   return value !== void 0 && value.missing === true;
 }
-function validateUrl(url) {
+function validateUrl$1(url) {
   let parsed;
   try {
     parsed = new URL(url);
@@ -6001,6 +6267,9 @@ async function pushChunk(payload) {
 }
 const KILLED_ERROR = "silent.fetch: the worker servicing this request was killed before it completed";
 const DEFAULT_SW_DEADLINE_MARGIN_MS = 4e3;
+const CLEANUP_BOUND_MS = 2e3;
+let cleanupBoundMs = CLEANUP_BOUND_MS;
+const SLICE_LEASE_BUDGET_MS = 3e4;
 let swDeadlineMarginMs = DEFAULT_SW_DEADLINE_MARGIN_MS;
 async function raceDeadline(promise, ms) {
   let timer;
@@ -6033,7 +6302,9 @@ function endKeepAlive() {
 }
 async function isWorkerReady(tabId, origin) {
   try {
-    const tab = await chrome.tabs.get(tabId);
+    const raced = await raceDeadline(chrome.tabs.get(tabId), cleanupBoundMs);
+    if (raced.timedOut) return false;
+    const tab = raced.value;
     return tab.status === "complete" && safeOrigin$3(tab.url ?? "") === origin;
   } catch {
     return false;
@@ -6055,17 +6326,21 @@ async function handleSilentFetch(msg) {
   if (!msg.url) {
     return { ok: false, code: ERROR_CODES.INVALID_PARAMS, error: "silent.fetch requires a url" };
   }
-  const urlError = validateUrl(msg.url);
+  const urlError = validateUrl$1(msg.url);
   if (urlError) {
     return { ok: false, code: ERROR_CODES.INVALID_PARAMS, error: urlError };
   }
   const origin = new URL(msg.url).origin;
   const maxBytes = Math.min(Math.max(1, Math.floor(msg.maxBytes ?? DEFAULT_MAX_BYTES)), effectiveMaxBodyBytes);
-  const timeoutMs = msg.timeoutMs ?? DEFAULT_TIMEOUT_MS$1;
+  const timeoutMs = msg.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const expect = msg.expect ?? "auto";
   let acquired;
   try {
-    acquired = await acquireWorker(origin, { bootstrapPath: msg.bootstrapPath, bootstrapTimeoutMs: msg.bootstrapTimeoutMs });
+    acquired = await acquireWorker(origin, {
+      bootstrapPath: msg.bootstrapPath,
+      bootstrapTimeoutMs: msg.bootstrapTimeoutMs,
+      leaseMs: timeoutMs + swDeadlineMarginMs + SLICE_LEASE_BUDGET_MS
+    });
   } catch (error) {
     if (error instanceof SilentPoolError) {
       return { ok: false, code: error.code, error: error.message };
@@ -6094,21 +6369,26 @@ async function handleSilentFetch(msg) {
       inlineThreshold: SLICE_BYTES,
       fetchImpl
     };
-    const injectOnce = () => chrome.scripting.executeScript({
-      target: { tabId: acquired.tabId },
-      world: "MAIN",
-      func: pageSilentFetchImpl,
-      args: [args],
-      // Silent Fetch rev 4 §D: document_idle (the default) waits for the
-      // worker tab's DOMContentLoaded-equivalent lifecycle point AGAIN --
-      // pointless here, since acquireWorker's own bootstrap already
-      // guarantees the tab reached DOMContentLoaded (silent-pool.ts's
-      // waitForTopFrameLoad) before ever handing the worker out, and a
-      // still-loading heavy page's OWN document_idle can arrive late (or,
-      // per that same rev 3 fix, sometimes not at all in Chrome's own
-      // observed sense) well after the tab is already perfectly injectable.
-      injectImmediately: true
-    });
+    const injectOnce = () => {
+      const pending = chrome.scripting.executeScript({
+        target: { tabId: acquired.tabId },
+        world: "MAIN",
+        func: pageSilentFetchImpl,
+        args: [args],
+        // Silent Fetch rev 4 §D: document_idle (the default) waits for the
+        // worker tab's DOMContentLoaded-equivalent lifecycle point AGAIN --
+        // pointless here, since acquireWorker's own bootstrap already
+        // guarantees the tab reached DOMContentLoaded (silent-pool.ts's
+        // waitForTopFrameLoad) before ever handing the worker out, and a
+        // still-loading heavy page's OWN document_idle can arrive late (or,
+        // per that same rev 3 fix, sometimes not at all in Chrome's own
+        // observed sense) well after the tab is already perfectly injectable.
+        injectImmediately: true
+      });
+      pending.catch(() => {
+      });
+      return pending;
+    };
     if (!await isWorkerReady(acquired.tabId, origin)) {
       await waitForWorkerReady(acquired.tabId, origin, WORKER_READY_RETRY_WAIT_MS);
     }
@@ -6142,8 +6422,19 @@ async function handleSilentFetch(msg) {
       }
     };
     const buildTimeoutResult = async (fallbackPhase, overrides) => {
-      const progress = overrides ? void 0 : await readProgress();
-      await abortAndCleanup();
+      const cleanupEndsAt = Date.now() + cleanupBoundMs;
+      let wedged = false;
+      let progress;
+      if (!overrides) {
+        const readRaced = await raceDeadline(readProgress(), Math.max(0, cleanupEndsAt - Date.now()));
+        if (readRaced.timedOut) wedged = true;
+        else progress = readRaced.value;
+      }
+      if (!wedged) {
+        const abortRaced = await raceDeadline(abortAndCleanup(), Math.max(0, cleanupEndsAt - Date.now()));
+        if (abortRaced.timedOut) wedged = true;
+      }
+      if (wedged) await recycleAfterFetchWedge(origin);
       const phase = progress?.phase ?? fallbackPhase;
       const bytesSoFar = overrides?.bytesSoFar ?? progress?.bytesSoFar ?? 0;
       const fetchNative = overrides?.fetchNative ?? progress?.fetchNative;
@@ -6236,16 +6527,16 @@ async function handleSilentFetch(msg) {
     for (; ; ) {
       let sliceResult;
       try {
-        const racedSlice = await raceDeadline(
-          chrome.scripting.executeScript({
-            target: { tabId: acquired.tabId },
-            world: "MAIN",
-            func: pageSilentFetchSliceImpl,
-            args: [{ bufferKey, index: seq, sliceBytes: SLICE_BYTES }],
-            injectImmediately: true
-          }),
-          remainingMs()
-        );
+        const slicePending = chrome.scripting.executeScript({
+          target: { tabId: acquired.tabId },
+          world: "MAIN",
+          func: pageSilentFetchSliceImpl,
+          args: [{ bufferKey, index: seq, sliceBytes: SLICE_BYTES }],
+          injectImmediately: true
+        });
+        slicePending.catch(() => {
+        });
+        const racedSlice = await raceDeadline(slicePending, remainingMs());
         if (killedCode) return { ok: false, code: killedCode, error: KILLED_ERROR };
         if (racedSlice.timedOut) {
           return await buildTimeoutResult("slicing", {
@@ -6301,6 +6592,395 @@ async function handleSilentPool() {
     ok: true,
     data: { workers: workers2.map((w) => ({ origin: w.origin, age_ms: w.ageMs, served: w.served, state: w.state })) }
   };
+}
+const DEFAULT_EVAL_TIMEOUT_MS = 3e4;
+const MAX_EVAL_TIMEOUT_MS = 6e5;
+const DEFAULT_MAX_RETURN_BYTES = 32 * 1024;
+const HARD_MAX_RETURN_BYTES = 1024 * 1024;
+const DEFAULT_MAX_SPILL_BYTES = 16 * 1024 * 1024;
+const MAX_SPILL_BYTES_CEILING = 100 * 1024 * 1024;
+const EVAL_CHUNK_BYTES = 1024 * 1024;
+const CDP_PROTOCOL_VERSION = "1.3";
+const EVAL_LEASE_MARGIN_MS = 3e4;
+const SPILL_BUDGET_MS = 3e4;
+const OBJECT_GROUP = "hermes-silent-eval";
+let pollIntervalMs = 500;
+let callBoundMs = 1e4;
+const INSTALL_FN = "function(){var s={done:false,ok:false,v:undefined};this.then(function(v){s.done=true;s.ok=true;s.v=v},function(e){s.done=true;s.ok=false;s.v=e});return s}";
+const POLL_FN = "function(){return this.done}";
+const FETCH_SETTLED_FN = "function(){if(!this.ok)throw this.v;return this.v}";
+const THIS_FN = "function(){return this}";
+const TERMINATED_RE = /execution was terminated/i;
+const attachedTabs = /* @__PURE__ */ new Set();
+if (typeof chrome !== "undefined" && chrome.debugger?.onDetach?.addListener) {
+  chrome.debugger.onDetach.addListener((source) => {
+    if (typeof source.tabId === "number") attachedTabs.delete(source.tabId);
+  });
+}
+onWorkerTeardown((tabId) => {
+  if (!attachedTabs.delete(tabId)) return;
+  try {
+    void Promise.resolve(chrome.debugger.detach({ tabId })).catch(() => {
+    });
+  } catch {
+  }
+});
+async function ensureAttached(tabId) {
+  if (attachedTabs.has(tabId)) return { reused: true };
+  try {
+    await chrome.debugger.attach({ tabId }, CDP_PROTOCOL_VERSION);
+  } catch (error) {
+    if (!/already attached/i.test(describeError(error))) throw error;
+    await chrome.debugger.detach({ tabId }).catch(() => {
+    });
+    await chrome.debugger.attach({ tabId }, CDP_PROTOCOL_VERSION);
+  }
+  attachedTabs.add(tabId);
+  return { reused: false };
+}
+function looksDetached(message) {
+  return /detach|not attached|no target with given id|target closed|inspected target/i.test(message);
+}
+const encoder = new TextEncoder();
+const decoder = new TextDecoder("utf-8");
+function serializeRemote(remote) {
+  const resultType = remote?.type ? remote.subtype ? `${remote.type}:${remote.subtype}` : remote.type : "undefined";
+  if (!remote || remote.type === "undefined") return { text: "", serialized: "string", resultType: "undefined" };
+  if ("value" in remote) {
+    const value = remote.value;
+    if (typeof value === "string") return { text: value, serialized: "string", resultType };
+    try {
+      const json = JSON.stringify(value);
+      if (json !== void 0) return { text: json, serialized: "json", resultType };
+    } catch {
+    }
+    return { text: String(value), serialized: "string", resultType };
+  }
+  if (remote.unserializableValue !== void 0) return { text: String(remote.unserializableValue), serialized: "string", resultType };
+  if (typeof remote.description === "string" && remote.description) return { text: remote.description, serialized: "string", resultType };
+  return { text: `<${remote.type ?? "value"}>`, serialized: "string", resultType };
+}
+function redactWhole(text, policy) {
+  const first = redactText(text, policy);
+  const second = redactSecrets(first.text);
+  return { text: second.text, count: first.count + second.count };
+}
+function utf8SafeCut(bytes, max) {
+  if (bytes.length <= max) return bytes.length;
+  let cut = Math.max(0, max);
+  while (cut > 0 && (bytes[cut] & 192) === 128) cut -= 1;
+  return cut;
+}
+function toHex(buffer) {
+  return [...new Uint8Array(buffer)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+async function sha256Hex(bytes) {
+  return toHex(await crypto.subtle.digest("SHA-256", bytes));
+}
+function toBase64(bytes) {
+  let binary = "";
+  const step = 32768;
+  for (let i = 0; i < bytes.length; i += step) binary += String.fromCharCode(...bytes.subarray(i, i + step));
+  return btoa(binary);
+}
+function clampInt(value, fallback, min, max) {
+  const n = typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : fallback;
+  return Math.min(max, Math.max(min, n));
+}
+function validateUrl(url) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return `silent.evaluate: not a valid absolute URL: ${JSON.stringify(url)}`;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return `silent.evaluate: unsupported URL scheme ${JSON.stringify(parsed.protocol)} (only http/https)`;
+  }
+  return parsed.origin && parsed.origin !== "null" ? void 0 : `silent.evaluate: url has no origin: ${JSON.stringify(url)}`;
+}
+async function handleSilentEvaluate(msg) {
+  const startedAt = Date.now();
+  if (!msg.url) return { ok: false, code: ERROR_CODES.INVALID_PARAMS, error: "silent.evaluate requires a url" };
+  const urlError = validateUrl(msg.url);
+  if (urlError) return { ok: false, code: ERROR_CODES.INVALID_PARAMS, error: urlError };
+  const expression = typeof msg.expression === "string" ? msg.expression : "";
+  if (!expression) return { ok: false, code: ERROR_CODES.INVALID_PARAMS, error: "silent.evaluate requires a non-empty expression" };
+  if (expression.length > MAX_EXPRESSION_CHARS) {
+    return {
+      ok: false,
+      code: ERROR_CODES.EVAL_EXPRESSION_TOO_LARGE,
+      error: `expression is ${expression.length} chars, over the ${MAX_EXPRESSION_CHARS}-char cap`
+    };
+  }
+  if (msg.world !== void 0 && msg.world !== "main") {
+    return { ok: false, code: ERROR_CODES.EVAL_WORLD_UNSUPPORTED, error: `world '${msg.world}' is not supported; only 'main' ships today` };
+  }
+  const settings = await getSettings();
+  const denial = await assertEvaluateAllowed(settings);
+  if (denial) return { ok: false, code: denial.code, error: denial.message };
+  const parsedUrl = new URL(msg.url);
+  const origin = parsedUrl.origin;
+  const timeoutMs = clampInt(msg.timeoutMs, DEFAULT_EVAL_TIMEOUT_MS, 1, MAX_EVAL_TIMEOUT_MS);
+  const awaitPromise = msg.awaitPromise ?? true;
+  const maxReturnBytes = clampInt(msg.maxReturnBytes, DEFAULT_MAX_RETURN_BYTES, 1, HARD_MAX_RETURN_BYTES);
+  const spill = msg.spill === true;
+  const maxSpillBytes = clampInt(msg.maxSpillBytes, DEFAULT_MAX_SPILL_BYTES, 1, MAX_SPILL_BYTES_CEILING);
+  let acquired;
+  try {
+    acquired = await acquireWorker(origin, {
+      kind: "eval",
+      // Navigate a freshly launched worker to the requested page (path and
+      // query, never the fragment); an idle worker already on the origin is
+      // reused as-is and this is ignored.
+      bootstrapPath: `${parsedUrl.pathname}${parsedUrl.search}`,
+      bootstrapTimeoutMs: msg.bootstrapTimeoutMs,
+      leaseMs: timeoutMs + EVAL_LEASE_MARGIN_MS
+    });
+  } catch (error) {
+    if (error instanceof SilentPoolError) return { ok: false, code: error.code, error: error.message };
+    return { ok: false, code: ERROR_CODES.SILENT_WORKER_LAUNCH_FAILED, error: describeError(error) };
+  }
+  let killedCode;
+  let resolveKilled;
+  const killedPromise = new Promise((resolve) => {
+    resolveKilled = resolve;
+  });
+  const unregister = registerInFlight(
+    origin,
+    (code) => {
+      if (killedCode === void 0) killedCode = code;
+      resolveKilled?.(killedCode);
+    },
+    "eval"
+  );
+  beginKeepAlive(acquired.tabId);
+  const killedResult = () => ({
+    ok: false,
+    code: killedCode ?? ERROR_CODES.SILENT_WORKER_KILLED,
+    error: (killedCode ?? ERROR_CODES.SILENT_WORKER_KILLED) === ERROR_CODES.SHARING_PAUSED ? "silent.evaluate: the user pressed Stop / paused sharing; the evaluation was aborted and its worker tab closed" : "silent.evaluate: the worker servicing this request was killed before it completed"
+  });
+  try {
+    const tabId = acquired.tabId;
+    const attachStartedAt = Date.now();
+    let attachReused;
+    try {
+      const attachAttempt = ensureAttached(tabId);
+      attachAttempt.catch(() => {
+      });
+      const attachRaced = await raceWallClock(attachAttempt, Math.min(callBoundMs, timeoutMs), killedPromise);
+      if (attachRaced.kind === "interrupted") return killedResult();
+      if (attachRaced.kind === "timeout") {
+        unregister();
+        await recycleAfterEvalWedge(origin);
+        return {
+          ok: false,
+          code: ERROR_CODES.SILENT_EVAL_TIMEOUT,
+          error: "silent.evaluate: the debugger could not attach to the worker tab in time; the worker tab was recycled"
+        };
+      }
+      attachReused = attachRaced.value.reused;
+    } catch (error) {
+      if (killedCode) return killedResult();
+      return { ok: false, code: ERROR_CODES.CDP_ERROR, error: `silent.evaluate: could not attach the debugger to the worker tab: ${describeError(error)}` };
+    }
+    const attachMs = Date.now() - attachStartedAt;
+    if (killedCode) return killedResult();
+    const evalStartedAt = Date.now();
+    const deadlineAt = evalStartedAt + timeoutMs;
+    const step = async (method, params, boundMs) => {
+      const remaining = deadlineAt - Date.now();
+      if (remaining <= 0) return { kind: "wedge" };
+      const attempt = chrome.debugger.sendCommand({ tabId }, method, params);
+      attempt.catch(() => {
+      });
+      const raced = await raceWallClock(attempt, Math.min(boundMs, remaining), killedPromise);
+      if (raced.kind === "interrupted") return { kind: "killed" };
+      if (raced.kind === "timeout") return { kind: "wedge" };
+      return { kind: "ok", value: raced.value };
+    };
+    const sleep2 = (ms) => interruptibleSleep(ms, killedPromise);
+    const releaseGroup = () => {
+      try {
+        void Promise.resolve(chrome.debugger.sendCommand({ tabId }, "Runtime.releaseObjectGroup", { objectGroup: OBJECT_GROUP })).catch(() => {
+        });
+      } catch {
+      }
+    };
+    const wedgedResult = async () => {
+      void Promise.resolve(chrome.debugger.sendCommand({ tabId }, "Runtime.terminateExecution", {})).catch(() => {
+      });
+      unregister();
+      await recycleAfterEvalWedge(origin);
+      return {
+        ok: false,
+        code: ERROR_CODES.SILENT_EVAL_TIMEOUT,
+        error: `silent.evaluate: no result within ${timeoutMs}ms; the expression may still be running (a dialog it opened, an infinite loop, or a promise that never settles) -- the worker tab was recycled`
+      };
+    };
+    let response;
+    try {
+      const started = await step(
+        "Runtime.evaluate",
+        {
+          expression,
+          returnByValue: false,
+          awaitPromise: false,
+          timeout: timeoutMs,
+          // CDP-native bound for a synchronous runaway; the wall-clock race is authoritative
+          userGesture: false,
+          objectGroup: OBJECT_GROUP
+        },
+        timeoutMs
+      );
+      if (started.kind === "killed") return killedResult();
+      if (started.kind === "wedge") return await wedgedResult();
+      const first = started.value;
+      const remote = first?.result;
+      if (first?.exceptionDetails) {
+        response = first;
+      } else if (!(awaitPromise && remote?.subtype === "promise" && remote.objectId)) {
+        if (remote?.objectId && !("value" in remote)) {
+          const fetched = await step(
+            "Runtime.callFunctionOn",
+            { objectId: remote.objectId, functionDeclaration: THIS_FN, returnByValue: true, objectGroup: OBJECT_GROUP },
+            callBoundMs
+          );
+          if (fetched.kind === "killed") return killedResult();
+          if (fetched.kind === "wedge") return await wedgedResult();
+          response = fetched.value;
+        } else {
+          response = first;
+        }
+      } else {
+        const installed = await step(
+          "Runtime.callFunctionOn",
+          { objectId: remote.objectId, functionDeclaration: INSTALL_FN, returnByValue: false, objectGroup: OBJECT_GROUP },
+          callBoundMs
+        );
+        if (installed.kind === "killed") return killedResult();
+        if (installed.kind === "wedge") return await wedgedResult();
+        const holderId = installed.value?.result?.objectId;
+        if (!holderId) {
+          return { ok: false, code: ERROR_CODES.CDP_ERROR, error: "silent.evaluate: could not observe the promise the expression returned" };
+        }
+        for (; ; ) {
+          const polled = await step(
+            "Runtime.callFunctionOn",
+            { objectId: holderId, functionDeclaration: POLL_FN, returnByValue: true, objectGroup: OBJECT_GROUP },
+            callBoundMs
+          );
+          if (polled.kind === "killed") return killedResult();
+          if (polled.kind === "wedge") return await wedgedResult();
+          if (polled.value?.result?.value === true) break;
+          if (await sleep2(pollIntervalMs)) return killedResult();
+        }
+        const settled = await step(
+          "Runtime.callFunctionOn",
+          { objectId: holderId, functionDeclaration: FETCH_SETTLED_FN, returnByValue: true, objectGroup: OBJECT_GROUP },
+          callBoundMs
+        );
+        if (settled.kind === "killed") return killedResult();
+        if (settled.kind === "wedge") return await wedgedResult();
+        response = settled.value;
+      }
+    } catch (error) {
+      if (killedCode) return killedResult();
+      const message = describeError(error);
+      if (looksDetached(message)) attachedTabs.delete(tabId);
+      return { ok: false, code: ERROR_CODES.CDP_ERROR, error: `silent.evaluate: Runtime call failed: ${message}` };
+    }
+    releaseGroup();
+    const evalMs = Date.now() - evalStartedAt;
+    const thrown = response?.exceptionDetails;
+    if (thrown && TERMINATED_RE.test(`${thrown.exception?.description ?? ""} ${thrown.text ?? ""}`)) return await wedgedResult();
+    const policy = redactionPolicyOf(settings);
+    const workerFacts = { reused: !acquired.launched, launched: acquired.launched, attach_reused: attachReused, worker_origin: origin };
+    const timing = () => ({
+      extension_ms: Date.now() - startedAt,
+      eval_ms: evalMs,
+      attach_ms: attachMs
+    });
+    if (response?.exceptionDetails) {
+      const ex = response.exceptionDetails.exception;
+      const detail = ex?.description ?? (ex?.value !== void 0 ? String(ex.value) : void 0) ?? response.exceptionDetails.text ?? "evaluate threw";
+      const redacted2 = redactWhole(detail, policy);
+      const bytes2 = encoder.encode(redacted2.text);
+      const cut2 = utf8SafeCut(bytes2, HARD_MAX_RETURN_BYTES);
+      return {
+        ok: true,
+        data: {
+          status: "error",
+          result_type: response.result?.type ?? "undefined",
+          truncated: cut2 < bytes2.length,
+          total_bytes: bytes2.length,
+          chunks: 0,
+          redactions: redacted2.count,
+          exception: decoder.decode(bytes2.subarray(0, cut2)),
+          timing: timing(),
+          diagnostics: workerFacts
+        }
+      };
+    }
+    const serial = serializeRemote(response?.result);
+    const redacted = redactWhole(serial.text, policy);
+    const bytes = encoder.encode(redacted.text);
+    const common = {
+      status: "ok",
+      result_type: serial.resultType,
+      serialized: serial.serialized,
+      total_bytes: bytes.length,
+      redactions: redacted.count
+    };
+    if (!spill) {
+      const cut2 = utf8SafeCut(bytes, maxReturnBytes);
+      const sent2 = bytes.subarray(0, cut2);
+      return {
+        ok: true,
+        data: {
+          ...common,
+          result: decoder.decode(sent2),
+          truncated: cut2 < bytes.length,
+          sha256: await sha256Hex(sent2),
+          chunks: 0,
+          timing: timing(),
+          diagnostics: workerFacts
+        }
+      };
+    }
+    const cut = utf8SafeCut(bytes, maxSpillBytes);
+    const sent = bytes.subarray(0, cut);
+    const truncated = cut < bytes.length;
+    const sha256 = await sha256Hex(sent);
+    if (sent.length === 0) {
+      return { ok: true, data: { ...common, result: "", truncated, sha256, chunks: 0, timing: timing(), diagnostics: workerFacts } };
+    }
+    let seq = 0;
+    const spillEndsAt = Date.now() + SPILL_BUDGET_MS;
+    for (let offset = 0; offset < sent.length; offset += EVAL_CHUNK_BYTES) {
+      const slice = sent.subarray(offset, Math.min(sent.length, offset + EVAL_CHUNK_BYTES));
+      if (killedCode) return killedResult();
+      const pushed = await raceWallClock(
+        pushChunk({
+          id: msg.requestId,
+          seq,
+          dataB64: toBase64(slice),
+          last: offset + EVAL_CHUNK_BYTES >= sent.length
+        }),
+        Math.max(0, spillEndsAt - Date.now()),
+        killedPromise
+      );
+      if (pushed.kind === "interrupted" || killedCode) return killedResult();
+      const ok = pushed.kind === "done" && pushed.value;
+      if (!ok) return { ok: false, code: ERROR_CODES.CDP_ERROR, error: "silent.evaluate: could not relay a chunk to the gateway" };
+      seq += 1;
+    }
+    return { ok: true, data: { ...common, truncated, sha256, chunks: seq, timing: timing(), diagnostics: workerFacts } };
+  } finally {
+    unregister();
+    endKeepAlive();
+    acquired.release();
+  }
 }
 function toWireCookie(cookie) {
   return {
@@ -7045,138 +7725,6 @@ async function handleConsoleEntries(msg) {
     entries.push(entry);
   }
   return { ok: true, data: { entries } };
-}
-const MAX_EXPRESSION_CHARS = 4096;
-const MAX_RESULT_CHARS = 32 * 1024;
-const DEFAULT_TIMEOUT_MS = 1e4;
-const MAX_TIMEOUT_MS = 3e4;
-const WALL_CLOCK_GRACE_MS = 500;
-function clampTimeout(requested) {
-  const value = typeof requested === "number" && requested > 0 ? requested : DEFAULT_TIMEOUT_MS;
-  return Math.min(value, MAX_TIMEOUT_MS);
-}
-function terminateBestEffort(tabId) {
-  void cdp.send(tabId, "Runtime.terminateExecution", {}).catch(() => {
-  });
-}
-function previewOf(remote) {
-  if (!remote) return { text: "undefined" };
-  if ("unserializableValue" in remote && remote.unserializableValue !== void 0) {
-    return { text: String(remote.unserializableValue), type: remote.type, subtype: remote.subtype };
-  }
-  if ("value" in remote) {
-    const value = remote.value;
-    if (value === null) return { text: "null", type: remote.type, subtype: remote.subtype };
-    if (typeof value === "string") return { text: value, type: remote.type, subtype: remote.subtype };
-    try {
-      return { text: JSON.stringify(value), type: remote.type, subtype: remote.subtype };
-    } catch {
-      return { text: String(value), type: remote.type, subtype: remote.subtype };
-    }
-  }
-  if (typeof remote.description === "string" && remote.description) {
-    return { text: remote.description, type: remote.type, subtype: remote.subtype };
-  }
-  return { text: remote.type ? `<${remote.type}>` : "<value>", type: remote.type, subtype: remote.subtype };
-}
-async function handlePageEvaluate(msg) {
-  const settings = await getSettings();
-  const denial = await assertEvaluateAllowed(settings);
-  if (denial) {
-    return { ok: false, code: denial.code, error: denial.message };
-  }
-  const limitedRefusal = cdpOnlyGate(msg.tabId, "evaluate");
-  if (limitedRefusal) {
-    return { ok: false, code: limitedRefusal.code, error: limitedRefusal.message };
-  }
-  const expression = typeof msg.expression === "string" ? msg.expression : "";
-  if (!expression) {
-    return { ok: false, code: ERROR_CODES.INVALID_PARAMS, error: "page.evaluate requires a non-empty expression" };
-  }
-  if (expression.length > MAX_EXPRESSION_CHARS) {
-    return {
-      ok: false,
-      code: ERROR_CODES.EVAL_EXPRESSION_TOO_LARGE,
-      error: `expression is ${expression.length} chars, over the ${MAX_EXPRESSION_CHARS}-char cap`
-    };
-  }
-  const world = msg.world ?? "main";
-  if (world !== "main") {
-    return {
-      ok: false,
-      code: ERROR_CODES.EVAL_WORLD_UNSUPPORTED,
-      error: `world '${world}' is not supported; only 'main' ships today (see docs/security.md §20)`
-    };
-  }
-  const timeoutMs = clampTimeout(msg.timeoutMs);
-  const awaitPromise = msg.awaitPromise ?? true;
-  let resolveCancelled;
-  const cancelHandle = registerCancellable(msg.tabId, "evaluate", (reason) => {
-    terminateBestEffort(msg.tabId);
-    resolveCancelled?.(reason);
-  });
-  const attempt = cdp.send(msg.tabId, "Runtime.evaluate", {
-    expression,
-    returnByValue: true,
-    // always true on the wire — see file header
-    awaitPromise,
-    timeout: timeoutMs,
-    // CDP-native bound; see file header for why it isn't sufficient alone
-    userGesture: false
-  });
-  let timeoutTimer;
-  const timeoutPromise = new Promise((resolve) => {
-    timeoutTimer = setTimeout(() => resolve({ kind: "timeout" }), timeoutMs + WALL_CLOCK_GRACE_MS);
-  });
-  const cancelPromise = new Promise((resolve) => {
-    resolveCancelled = (reason) => resolve({ kind: "cancelled", reason });
-  });
-  let outcome;
-  try {
-    outcome = await Promise.race([
-      attempt.then((sent2) => ({ kind: "sent", sent: sent2 })),
-      timeoutPromise,
-      cancelPromise
-    ]);
-  } finally {
-    clearTimeout(timeoutTimer);
-    cancelHandle.unregister();
-  }
-  if (outcome.kind === "cancelled") {
-    return {
-      ok: false,
-      code: codeForCancelReason(outcome.reason),
-      error: `evaluate was cancelled (${outcome.reason}) before it finished; Runtime.terminateExecution was requested best-effort on tab ${msg.tabId} — the expression may still be running if a dialog or a frozen main thread kept the termination itself from taking effect`
-    };
-  }
-  if (outcome.kind === "timeout") {
-    terminateBestEffort(msg.tabId);
-    return {
-      ok: false,
-      code: ERROR_CODES.TIMEOUT,
-      error: `evaluate exceeded its ${timeoutMs}ms timeout; the expression may still be running in the page (a dialog it opened, an infinite loop, or a pending promise) — this call gave up waiting rather than hang every subsequent browser_bridge_* call on tab ${msg.tabId}`
-    };
-  }
-  const sent = outcome.sent;
-  if (!sent.ok) {
-    return { ok: false, code: sent.error.code, error: sent.error.message };
-  }
-  if (sent.result.exceptionDetails) {
-    const detail = sent.result.exceptionDetails.exception?.description ?? sent.result.exceptionDetails.text ?? "evaluate threw";
-    return { ok: false, code: ERROR_CODES.CDP_ERROR, error: detail };
-  }
-  const preview = previewOf(sent.result.result);
-  const policy = redactionPolicyOf(settings);
-  const { text: redacted, truncated } = redactThenTruncate(preview.text, MAX_RESULT_CHARS, policy);
-  return {
-    ok: true,
-    data: {
-      result: redacted,
-      resultType: preview.type,
-      resultSubtype: preview.subtype,
-      truncated
-    }
-  };
 }
 const CORRELATION_WINDOW_MS = 1e4;
 const MAX_ATTRIBUTION_ENTRIES = 200;
@@ -8505,6 +9053,12 @@ chrome.runtime.onMessage.addListener(
       case "silent.fetch":
         blinkSilentFetchActivity();
         void handleSilentFetch(message).then(sendResponse).catch(
+          (error) => sendResponse({ ok: false, error: describeError(error) })
+        );
+        return true;
+      case "silent.evaluate":
+        blinkSilentFetchActivity();
+        void handleSilentEvaluate(message).then(sendResponse).catch(
           (error) => sendResponse({ ok: false, error: describeError(error) })
         );
         return true;

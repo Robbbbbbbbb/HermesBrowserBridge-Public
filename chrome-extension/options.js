@@ -108,12 +108,15 @@ const redactEmails = el("redactEmails");
 const redactPhones = el("redactPhones");
 const allowFileUpload = el("allowFileUpload");
 const allowFileUploadFromAgent = el("allowFileUploadFromAgent");
+const uploadApproval = el("uploadApproval");
 const allowDialogDismiss = el("allowDialogDismiss");
 const allowDialogAccept = el("allowDialogAccept");
 const allowEvaluate = el("allowEvaluate");
+const evaluateApproval = el("evaluateApproval");
 const allowConsoleRead = el("allowConsoleRead");
 const allowCookieWrite = el("allowCookieWrite");
 const allowHttpAuth = el("allowHttpAuth");
+const httpAuthApproval = el("httpAuthApproval");
 const allowDownloadsRead = el("allowDownloadsRead");
 const uploadRoots = el("uploadRoots");
 const maxUploadBytes = el("maxUploadBytes");
@@ -138,12 +141,15 @@ function apply(settings) {
   redactPhones.checked = settings.redactPhones;
   allowFileUpload.checked = settings.allowFileUpload;
   allowFileUploadFromAgent.checked = settings.allowFileUploadFromAgent;
+  uploadApproval.value = settings.uploadApproval;
   allowDialogDismiss.checked = settings.allowDialogDismiss;
   allowDialogAccept.checked = settings.allowDialogAccept;
   allowEvaluate.checked = settings.allowEvaluate;
+  evaluateApproval.value = settings.evaluateApproval;
   allowConsoleRead.checked = settings.allowConsoleRead;
   allowCookieWrite.checked = settings.allowCookieWrite;
   allowHttpAuth.checked = settings.allowHttpAuth;
+  httpAuthApproval.value = settings.httpAuthApproval;
   allowDownloadsRead.checked = settings.allowDownloadsRead;
   uploadRoots.value = settings.uploadRoots;
   maxUploadBytes.value = String(settings.maxUploadBytes);
@@ -160,7 +166,7 @@ function redactionChanged(previous) {
   return redactPasswords.checked !== previous.redactPasswords || redactCreditCards.checked !== previous.redactCreditCards || redactSsn.checked !== previous.redactSsn || redactEmails.checked !== previous.redactEmails || redactPhones.checked !== previous.redactPhones;
 }
 function powersChanged(previous) {
-  return allowFileUpload.checked !== previous.allowFileUpload || allowFileUploadFromAgent.checked !== previous.allowFileUploadFromAgent || allowDialogDismiss.checked !== previous.allowDialogDismiss || allowDialogAccept.checked !== previous.allowDialogAccept || allowEvaluate.checked !== previous.allowEvaluate || allowConsoleRead.checked !== previous.allowConsoleRead || allowCookieWrite.checked !== previous.allowCookieWrite || allowHttpAuth.checked !== previous.allowHttpAuth || allowDownloadsRead.checked !== previous.allowDownloadsRead || uploadRoots.value !== previous.uploadRoots || Number(maxUploadBytes.value) !== previous.maxUploadBytes;
+  return allowFileUpload.checked !== previous.allowFileUpload || allowFileUploadFromAgent.checked !== previous.allowFileUploadFromAgent || uploadApproval.value !== previous.uploadApproval || allowDialogDismiss.checked !== previous.allowDialogDismiss || allowDialogAccept.checked !== previous.allowDialogAccept || allowEvaluate.checked !== previous.allowEvaluate || evaluateApproval.value !== previous.evaluateApproval || allowConsoleRead.checked !== previous.allowConsoleRead || allowCookieWrite.checked !== previous.allowCookieWrite || allowHttpAuth.checked !== previous.allowHttpAuth || httpAuthApproval.value !== previous.httpAuthApproval || allowDownloadsRead.checked !== previous.allowDownloadsRead || uploadRoots.value !== previous.uploadRoots || Number(maxUploadBytes.value) !== previous.maxUploadBytes;
 }
 function defaultAccessModeChanged(previous) {
   return defaultAccessMode.value !== previous.defaultAccessMode;
@@ -190,12 +196,15 @@ el("save").addEventListener("click", async () => {
     redactPhones: redactPhones.checked,
     allowFileUpload: allowFileUpload.checked,
     allowFileUploadFromAgent: allowFileUploadFromAgent.checked,
+    uploadApproval: uploadApproval.value,
     allowDialogDismiss: allowDialogDismiss.checked,
     allowDialogAccept: allowDialogAccept.checked,
     allowEvaluate: allowEvaluate.checked,
+    evaluateApproval: evaluateApproval.value,
     allowConsoleRead: allowConsoleRead.checked,
     allowCookieWrite: allowCookieWrite.checked,
     allowHttpAuth: allowHttpAuth.checked,
+    httpAuthApproval: httpAuthApproval.value,
     allowDownloadsRead: allowDownloadsRead.checked,
     uploadRoots: uploadRoots.value,
     maxUploadBytes: Number(maxUploadBytes.value) || 0,

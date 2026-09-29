@@ -39,6 +39,7 @@ that enforced, and what are the actual holes."
 23. [Replay: a local, off-by-default recording of what the agent did (G7)](#23-replay-a-local-off-by-default-recording-of-what-the-agent-did-g7)
 24. [Silent fetch: a tab-less, unattended request lane (SF1–SF7)](#24-silent-fetch-a-tab-less-unattended-request-lane-sf1sf7)
 25. [Origins are compared canonically everywhere a grant is looked up](#25-origins-are-compared-canonically-everywhere-a-grant-is-looked-up)
+26. [Silent evaluate: JavaScript in the hidden worker (EP2)](#26-silent-evaluate-javascript-in-the-hidden-worker-ep2)
 
 ## Capability matrix
 
@@ -46,7 +47,9 @@ One row per `protocol/schema.json` `approval.request.capability` enum value.
 **Setting/default** verified against `extension/src/lib/storage.ts`'s
 `DEFAULT_SETTINGS`; **ceiling** and **standing grant** verified against
 `hermes_plugin/approvals.py`'s `DANGEROUS_CAPABILITIES` (the ceiling set) and
-`NO_STANDING_GRANT_CAPABILITIES` (the never-`always`/`session` subset);
+`APPROVAL_POLICY_KEYS` (the never-`always`/`session` subset, and — EP1 — the
+three capabilities a per-device approval policy can silence entirely; see
+"EP1: configurable approval policy" below the matrix);
 **setting name** verified against `hermes_plugin/tools.py`'s
 `_CAPABILITY_POWER_KEYS`.
 
@@ -61,14 +64,81 @@ One row per `protocol/schema.json` `approval.request.capability` enum value.
 | `cookies` | `browser_bridge_cookies` | — (mode only) | No — `include_values` uses the same approval path as presence-only | Approval scope | Gateway (`_authorize`) | Cookie metadata, and values if `include_values`+approved |
 | `network` | `browser_bridge_network` | — (mode only) | Bodies specifically need standing `full` (§1a) even after an approval | Approval scope (metadata only) | Gateway (`_authorize` + a direct `full` re-check for bodies) | Request/response metadata; bodies only at `full` |
 | `open_tab` | `browser_bridge_open_tab` | — (mode only) | No | Approval scope | Gateway (`_authorize`) | Opens and attaches a new tab at an http(s) URL |
-| `upload` | `browser_bridge_upload` | `allowFileUpload` (off, tier 1) / `allowFileUploadFromAgent` (off, tier 2) | **Yes** | **Never** (`NO_STANDING_GRANT_CAPABILITIES`) | Extension (`powers.ts` per-tier check, path allowlist / magic-byte sniff) + gateway (same checks, mirrored) | A local file's contents, handed to the page |
-| `evaluate` | `browser_bridge_evaluate` | `allowEvaluate` (off) | **Yes** | **Never** (`NO_STANDING_GRANT_CAPABILITIES`) | Extension (wall-clock timeout, result redaction) + gateway (redaction, audit) | Full page JS execution — cookies, storage, `fetch()`, DOM (§20) |
+| `upload` | `browser_bridge_upload` | `allowFileUpload` (off, tier 1) / `allowFileUploadFromAgent` (off, tier 2) | **Yes** | **Never a host-side grant** (`APPROVAL_POLICY_KEYS`) — but `uploadApproval` (EP1) can skip the live prompt on a `full` origin | Extension (`powers.ts` per-tier check, path allowlist / magic-byte sniff) + gateway (same checks, mirrored) | A local file's contents, handed to the page |
+| `evaluate` | `browser_bridge_evaluate` | `allowEvaluate` (**on** on a fresh install; stored off is kept) | **Yes** | **Never a host-side grant** (`APPROVAL_POLICY_KEYS`) — but `evaluateApproval` (EP1) can skip the live prompt on a `full` origin | Extension (wall-clock timeout, result redaction) + gateway (redaction, audit) | Full page JS execution — cookies, storage, `fetch()`, DOM (§20) |
 | `cookies_write` | `browser_bridge_cookie_set` | `allowCookieWrite` (off) | **Yes** | once/session/always | Extension (`assertCookieWriteAllowed`, `attachedOrigins()` bound) + gateway (`_device_power_denial`, fresh `tabs.list` bound) | Writes/overwrites one named cookie |
-| `http_auth` | `browser_bridge_http_auth_status` | `allowHttpAuth` (off) | **Yes** | **Never** (`NO_STANDING_GRANT_CAPABILITIES`) | Read-only; arming itself is extension-only, no wire method exists for it | Whether a credential is armed for an origin (never the credential) |
+| `http_auth` | `browser_bridge_http_auth_status` | `allowHttpAuth` (off) | **Yes** | **Never a host-side grant** (`APPROVAL_POLICY_KEYS`) — but `httpAuthApproval` (EP1) can skip the live prompt on a `full` origin | Read-only; arming itself is extension-only, no wire method exists for it | Whether a credential is armed for an origin (never the credential) |
 | `dialog` | `browser_bridge_dialog` (`accept` only — dismiss is ungated) | `allowDialogAccept` (off); `allowDialogDismiss` (on, not capability-gated) | **Yes** (accept only) | once/session/always | Extension (`ack_message` exact-match) + gateway (approval routing) | The dialog's own message text; accept/dismiss action |
 | `downloads` | `browser_bridge_downloads` | `allowDownloadsRead` (**on**) | **Yes** | once/session/always | Extension (static never-list scan, origin scoping) + gateway (`_device_power_denial`) | Download history metadata, scoped to attached origins |
 | `console` | `browser_bridge_console` | `allowConsoleRead` (off) | **Yes** | once/session/always | Extension (`assertConsoleReadAllowed`, unconditional secret redaction) + gateway (redaction re-check) | console.log/warn/error, exceptions, browser-generated messages |
 | `silent_fetch` | `browser_bridge_silent_fetch` | — (per-origin popup "Background requests": off/ask/always, plus `silent_fetch.full_implies_silent` config default) | No | Session-scoped only (`ask` → once/session via `session_grants`; never promotes to a standing `always` row) | Gateway only (`silent_grants.authorize_silent_fetch` + its own SSRF guard + rate guard); the extension's worker pool trusts nothing but its own kill switch | Response body/headers via a hidden worker tab's own request — no tab ever attached or visible |
+| `silent_evaluate` | `browser_bridge_silent_evaluate` | `allowEvaluate` (**on** on a fresh install; stored off is kept) AND the per-origin "Background requests" setting; `evaluateApproval` (EP1) policy applies only when that setting resolves zero-touch | **Yes** | **Never a host-side grant** (`APPROVAL_POLICY_KEYS`); own per-connection `ask_per_session` grant, separate from `evaluate`'s | Gateway (`silent_evaluate.py`: kill switch, `_device_power_denial`, SSRF, grant resolution, approval, shared rate guard, redaction re-check, audit) + extension (deadline, redaction, worker recycle) | Full page JS in a hidden worker tab — cookies, storage, `fetch()` with the user's session — with no visible tab (§26) |
+
+
+### EP1: configurable approval policy for evaluate / upload / http_auth
+
+Before EP1, `evaluate`/`upload`/`http_auth` had exactly one behaviour: every
+single call presented a live approval prompt, on every device, in every
+mode, with no opt-out — because they can never earn a host-side standing
+grant (the "Standing grant" column above), the popup had no other lever to
+pull. That killed at least one legitimate unattended workflow (a multi-
+hundred-step sweep whose prompts expired unanswered with nobody at the
+keyboard).
+
+EP1 adds a per-device, per-capability **approval policy**, reported on the
+same `powerPolicy` wire object as the `allow*` power toggles
+(`protocol/schema.json`'s `definitions.powerPolicy`): `evaluateApproval`,
+`uploadApproval`, `httpAuthApproval`, each one of exactly three strings —
+`always_allow`, `ask_per_session`, `always_ask` — read by
+`hermes_plugin/approvals.py`'s `approval_policy(device_id, capability)` off
+`hermes_plugin/state.py`'s `get_power_policy` (`APPROVAL_POLICY_FIELDS`,
+parsed with a strict enum check — `_power_approval_policy` — so anything
+that isn't an exact match, including an absent field, a stray type, or a
+value from a future version this gateway doesn't recognise, reads as the
+safe default).
+
+**The floor.** The policy is consulted ONLY when the calling origin's mode
+(`state.get_mode`) is `full`. A `request`-mode origin prompts every call
+regardless of what the device reports — this is deliberate and unconditional
+(`hermes_plugin/tools.py`'s `_authorize`, right before it would otherwise
+call `approvals.require`): a policy is a per-device convenience for an
+already-trusted origin, never a way to make an untrusted one quieter. The
+operator kill switch (`browser_bridge.powers.<capability>: false`) and the
+device-side power denial both still run first, unaffected by any of this.
+
+**The three values:**
+
+- `always_allow` — no prompt, ever, on a `full` origin. `_authorize` records
+  a `grant_check` audit line with `decision: allow`, `scope: policy` — this
+  audit line, plus the capability's own normal audit line (`tool_evaluate`,
+  etc., unchanged in every mode), is the compensation for the human gate this
+  removes: there is no live approval to review after the fact, only the log.
+- `ask_per_session` — the first call on a given (device, THIS relay
+  connection, origin, capability) still prompts; any allow answer creates an
+  **in-memory, connection-scoped** grant (`hermes_plugin/approvals.py`'s
+  `_policy_session_grants`, keyed by `relay.py`'s `Connection.connection_id`
+  — a fresh UUID minted per socket, never reused) that silences every
+  further call on that exact key. It is cleared the moment that connection
+  closes (`Relay._drop` calls `approvals.clear_connection_policy_grants`) or
+  the gateway restarts (in-memory, nothing to reap). A reconnect — even of
+  the same device, same origin — gets a brand-new `connection_id` and so
+  prompts again on its first call. This is never persisted to SQLite.
+- `always_ask` — the pre-EP1 behaviour, unchanged: every call prompts. Also
+  the value used for a missing, corrupt, or out-of-enum reported value, and
+  the effective value whenever the floor above isn't met.
+
+**What EP1 does NOT change.** The host `ApprovalRequest` for these three
+capabilities is still built with `allow_session=False`,
+`allow_permanent=False` in every mode — a host-side "always"/"session"
+choice is refused server-side regardless of the policy in effect
+(`resolve()`'s `allowed_choices` check). A SQLite `capability_grants` /
+`session_grants` row for one of these three capabilities is still refused on
+read even if one somehow exists (`standing_grant_refused` audit event) — a
+write-side guard is not a read-side guard, and this task's own tests prove
+the read-side refusal independently by seeding a row directly and asserting
+it is never honoured. The approval policy is a SEPARATE, gateway-side
+mechanism, keyed off `powerPolicy`, that only ever decides whether to
+present a live prompt at all — it never widens what a "yes" answer confers.
 
 ## 1. The three per-origin modes
 
@@ -1495,10 +1565,15 @@ action reachable through the ordinary `act` capability, even though tier 1
 resolution end to end. `upload` is one of G0.5's `DANGEROUS_CAPABILITIES`: a
 `full` origin grant never covers it, `always`/`session` are refused
 server-side (`approvals.py`'s `allow_session=allow_permanent=False` for this
-capability, per G0.5.4 — the same three-in-`NO_STANDING_GRANT_CAPABILITIES`
-set as `evaluate`/`http_auth`), and every call raises a live approval prompt
-naming the file's **basename and origin only**, never a full path (which can
-embed a username or home-directory layout) and never the file's contents.
+capability, per G0.5.4 — the same three-capability `APPROVAL_POLICY_KEYS`
+set as `evaluate`/`http_auth`), and whether a given call still raises a live
+approval prompt is governed by this device's `uploadApproval` policy (EP1
+above) — the extension's own default is `ask_per_session`, and any mode that
+does prompt names the file's **basename and origin only**, never a full path
+(which can embed a username or home-directory layout) and never the file's
+contents. A device that never reports `uploadApproval` (or reports something
+missing/corrupt) falls back to `always_ask` gateway-side, not to the
+extension's default.
 
 **Two tiers, gated by two independent device settings (§0.6 rows 1/2), and —
 this is the point the earlier settings scaffold's own comment already
@@ -1692,15 +1767,32 @@ session already attached:**
   runs in the page's existing execution context, never a detached one.
 
 **This is not a new hole opened by a bug — it is the DevTools console,
-verbatim, and is why it ships off by default** (`allowEvaluate`, row 5 of the
-Powers table, default **off**), gated by the `evaluate` capability (one of
+verbatim, and it ships ON by default on a fresh install** (`allowEvaluate`,
+row 5 of the Powers table, default **on**; an install that already stored off
+keeps it off, and a gateway that never heard the device's power policy treats
+it as off), gated by the `evaluate` capability (one of
 `approvals.py`'s seven `DANGEROUS_CAPABILITIES`, §12), and — unlike every
-other capability — **NEVER available as a standing grant**: `evaluate` is one
-of the three members of `NO_STANDING_GRANT_CAPABILITIES` (alongside `upload`
-and `http_auth`), so `always` and `session` are not offered as approval
-choices at all (§12), and a `full`-mode origin still prompts for it every
-time (the per-capability ceiling, §12, applies in full here). Every single
-evaluation is a fresh, individually-reviewed decision.
+other capability — **NEVER available as a host-side standing grant**:
+`evaluate` is one of the three members of `APPROVAL_POLICY_KEYS` (alongside
+`upload` and `http_auth`), so `always` and `session` are not offered as
+approval choices at all (§12), and a `full`-mode origin's per-capability
+ceiling (§12) still routes through a policy check rather than a host grant.
+Whether an individual evaluation still raises a live prompt is this
+device's own `evaluateApproval` policy (EP1, above the capability matrix):
+`always_ask` reviews every single evaluation fresh; `ask_per_session`
+reviews the first one per connection; `always_allow` reviews none, leaning
+entirely on the audit trail instead. The extension's own default for
+`evaluateApproval` is `always_allow` — deliberately the least-prompting
+setting, and `allowEvaluate` is on by default too, so the defaults combine
+into a no-prompt path (see the next paragraph).
+
+**Default posture, stated plainly.** With the shipped defaults (`default_mode`
+full, `silent_fetch.full_implies_silent` true, `allowEvaluate` on,
+`evaluateApproval` `always_allow`), the agent can run arbitrary JavaScript via
+`browser_bridge_evaluate` on any attached Full-access tab, and via
+`browser_bridge_silent_evaluate` on any zero-touch origin, with no prompt.
+Every call is audited. To restore a prompt: set the origin to `request`, set
+Approval to "Ask every time", or turn Run JavaScript off.
 
 **The approval prompt shows the expression itself, not just a label.** The
 extension's popup renders only the approval's `summary` field (not `detail` —
@@ -1808,11 +1900,14 @@ that echoes `document.cookie`-shaped and bearer-token-shaped content; no
 `objectId` ever present on the wire). Gateway side: `tests/test_g15_evaluate.py`
 (the expression sent to `relay.call` is byte-identical to the one supplied,
 even when the audit/approval-display copy has been redacted; `evaluate` is
-refused on a `full` origin without an approval; `always`/`session` are
-refused for `evaluate` — the existing `NO_STANDING_GRANT_CAPABILITIES`
-machinery in `tests/test_m2_approvals.py` already covers this generically and
-is not re-derived here; the operator kill switch and device-power-policy
-denial both fire before any approval is raised).
+refused on a `full` origin without an approval (`always_ask`, the default
+fallback); `always`/`session` are refused for `evaluate` — the existing
+`APPROVAL_POLICY_KEYS` machinery in `tests/test_m2_approvals.py` already
+covers this generically and is not re-derived here; a dedicated EP1 case in
+that same file proves `evaluateApproval=always_allow` skips the prompt
+entirely while still writing the full `tool_evaluate` audit line; the
+operator kill switch and device-power-policy denial both fire before any
+approval or policy check is ever reached).
 
 ## 21. Iframes: every frame is gated by its OWN origin (G2.2.13)
 
@@ -1946,7 +2041,7 @@ and cookie ops are unaffected either way — neither was ever CDP-based.
 
 **Security parity (no separate, weaker gate for limited mode).** Every
 limited-mode action goes through the EXACT SAME gateway-side authorization
-as a full-mode one — origin mode, approvals, `NO_STANDING_GRANT`
+as a full-mode one — origin mode, approvals, `APPROVAL_POLICY_KEYS`
 capabilities and power toggles (§0, §1, §12 above) never branch on
 `attachMode` at all, because the gateway's own tool handlers
 (`hermes_plugin/tools.py`) don't distinguish it; `attachMode` is reported
@@ -2054,7 +2149,7 @@ rule 4).
 **Approvals here use the `silent_fetch` capability**, distinct from the
 existing `fetch` capability `browser_bridge_fetch` uses — a standing session
 grant for one never silently covers the other, even against the identical
-origin. Like every other capability in `NO_STANDING_GRANT_CAPABILITIES`'s
+origin. Like every other capability in `APPROVAL_POLICY_KEYS`'s
 spirit (though implemented as its own explicit rule in `authorize_silent_fetch`
 rather than that shared constant), a granted "ask" here is session-scoped
 only: it never promotes an origin to a standing "always" popup row the way
@@ -2197,3 +2292,47 @@ grant set under one spelling honoured under another; and a legacy
 non-canonical row actually being retired (not just out-ranked) the moment a
 fresh write means to supersede it, for both `grants` and
 `origin_silent_mode`.
+
+## 26. Silent evaluate: JavaScript in the hidden worker (EP2)
+
+Operator guide: [`silent-evaluate.md`](silent-evaluate.md). This section is
+the "what is enforced and where" companion.
+
+`browser_bridge_silent_evaluate` combines two existing powers: the tab-less
+worker of section 24 and the arbitrary-code capability of section 20. Its
+marginal power over silent fetch is reading `document` and storage;
+its marginal power over interactive evaluate is that no tab is visible and
+no attach happens. The gates are therefore the union of both, checked in this
+order by `hermes_plugin/silent_evaluate.py`: parameters, enabled flags,
+operator kill switch (`powers.silent_evaluate` or `powers.evaluate` false),
+device `allowEvaluate`, SSRF guard, origin grant (the same resolution
+`silent_fetch` uses, `silent_grants.resolve_silent_origin`), approval, the
+shared rate bucket, the per-origin slot.
+
+- **Zero-touch floor.** The EP1 `evaluateApproval` policy is consulted only
+  when the Background requests resolution is zero-touch. An origin that
+  resolves to "ask" prompts on every call, whatever the policy says.
+- **Separate grant.** `silent_evaluate` is its own capability id in
+  `APPROVAL_POLICY_KEYS` and `DANGEROUS_CAPABILITIES`. An `ask_per_session`
+  grant for interactive `evaluate` does not cover it, and no host-side or
+  SQLite standing grant can exist for it (refused on read as well as write).
+- **Rate guard counts bridge calls only.** The bucket is shared with
+  `silent_fetch`; fetches inside the expression are not counted. That is the
+  design (batch in one expression), not an oversight, and it is why the
+  audit line and the expression display, not the limiter, are the review
+  mechanism for what an expression did.
+- **Redaction.** The extension redacts the serialized result before it leaves
+  the device; the gateway re-scans it (belt and braces) before truncating,
+  returning or writing it.
+- **Spill sink.** `spill_to_path` takes a file name, never a path, so
+  page-controlled data cannot be written to an agent-chosen location. Files
+  land in `silent_evaluate.spill_dir` (0700), mode 0600, atomic write;
+  symlink and directory targets are refused.
+- **Blast radius under `always_allow`.** As in section 20, an approved
+  expression can do anything the user's session can do on that origin, with no
+  prompt at all when the policy says so. The `silent_eval` audit line
+  (expression, origin, device, timing, outcome, spill path and hash) is the
+  after-the-fact control.
+- **Debugger banner.** One persistent `chrome.debugger` session per worker
+  can show Chrome's debugging banner on the minimized background window; it
+  is not part of the interactive lane's attach/lease/glow model.

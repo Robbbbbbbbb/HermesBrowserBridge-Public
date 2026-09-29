@@ -33,6 +33,11 @@ this document follows the code. See `hermes_plugin/skill/SKILL.md` §9f /
 `hermes_plugin/skill/references/headless-fetch.md` for the agent-facing
 version of this same material (params/result table, paging pattern).
 
+> **Running JavaScript instead of one request per call?** See
+> [`silent-evaluate.md`](silent-evaluate.md): `browser_bridge_silent_evaluate`
+> runs an expression in this same hidden worker tab (same Background requests
+> grant, same rate bucket), for batching a whole sweep into one call.
+
 ## Contents
 
 1. [The grant model](#1-the-grant-model)
@@ -377,3 +382,39 @@ implementation changes. The result (and any TIMEOUT failure) always reports
 which impl actually ran as `fetch_impl`, so a native retry that still stalls
 tells you the drain itself (network-level, or the target simply being slow)
 is the real bottleneck, not the page's wrapper.
+
+## 7. See also: silent evaluate (EP2)
+
+`browser_bridge_silent_evaluate` reuses this lane's worker pool, the
+"Background requests" grant, the SSRF guard, the rate bucket and the
+per-origin slot. What it adds: it needs the device's Run JavaScript setting,
+it has its own approval policy row (`silent_evaluate`, floor at zero-touch
+origins), workers are single-flight across fetch and evaluate
+(`SILENT_WORKER_BUSY`, 4265), and a timed-out evaluation recycles the worker
+(`silent.worker` action `eval_wedge`). Full guide:
+[`silent-evaluate.md`](silent-evaluate.md).
+
+## 8. Stuck worker: auto-reclaim, the CLI, and the tool
+
+Symptom: every call to one origin fails with `SILENT_WORKER_BUSY` (4265) long
+after the call that started it timed out. Cause: the gateway gave up waiting
+(`TIMEOUT`, 4300) on a `silent.fetch` that hung extension-side, but the
+extension's worker stayed marked busy.
+
+- **Automatic.** When the gateway's own wait for `silent.fetch` expires it sends
+  `silent.kill {origin}` to that device (best-effort, at most ~2 s, never
+  raises into the tool result) and adds `worker_reclaimed` plus a hint to the
+  error: retry and you get a fresh worker. A 4265 the gateway did not cause
+  (nothing of its own holds that origin's slot) is treated the same way: one
+  `silent.kill`, the 4265 returned with a "retry once" hint. 4264 and 4259
+  never trigger it, since the extension already recycled or killed the worker.
+  Every attempt is audited as `silent_worker_reclaim` (device, origin,
+  `trigger` = `relay_timeout` / `orphaned_busy` / `operator` / `agent`,
+  method, `sent`).
+- **Agent tool.** `browser_bridge_silent_kill {origin, device_id?}` closes one
+  origin's worker on demand. Always allowed, since it only closes the hidden
+  worker tab.
+- **Operator CLI.** `hermes browser-bridge silent kill [ORIGIN] [--all]
+  [--device DEVICE_ID]`. It needs the relay in the same process, which is not
+  the case for a normal shell (the relay lives in the gateway): there it
+  refuses and points at the agent tool. Popup "Stop" / kill buttons also work.

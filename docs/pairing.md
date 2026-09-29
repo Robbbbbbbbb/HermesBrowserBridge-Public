@@ -49,7 +49,7 @@ Confirm the relay bound and the plugin loaded from the audit log (the last
 ```
 $ ssh your-gateway-host 'tail -3 ~/.hermes/browser_bridge/audit.jsonl'
 {"ts":...,"event":"relay_started","host":"0.0.0.0","port":8765,"protocol_version":"1.0"}
-{"ts":...,"event":"plugin_loaded","version":"0.2.4","tools":["browser_bridge_status","browser_bridge_attach","browser_bridge_release","browser_bridge_snapshot","browser_bridge_read","browser_bridge_act","browser_bridge_ask","browser_bridge_screenshot","browser_bridge_fetch","browser_bridge_cookies","browser_bridge_network"],"relay_started":true,"relay_error":"","port":8765,"devices":0}
+{"ts":...,"event":"plugin_loaded","version":"0.2.7","tools":["browser_bridge_status","browser_bridge_attach","browser_bridge_release","browser_bridge_snapshot","browser_bridge_read","browser_bridge_act","browser_bridge_ask","browser_bridge_screenshot","browser_bridge_fetch","browser_bridge_cookies","browser_bridge_network"],"relay_started":true,"relay_error":"","port":8765,"devices":0}
 ```
 
 If `relay_started` is `false`, see **"the gateway is not listening"** in

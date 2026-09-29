@@ -1722,6 +1722,37 @@ def _power_max_upload_bytes(value: Any) -> int:
     return 0
 
 
+# EP1 (ep1-contract.md): the three per-capability approval-policy fields
+# riding the same `powerPolicy` wire object as POWER_KINDS above, but
+# strings, not booleans -- one of APPROVAL_POLICY_VALUES, never anything
+# else. Mirrors `hermes_plugin/approvals.py`'s `APPROVAL_POLICY_KEYS` (this
+# tuple is that dict's values) and extension/src/lib/storage.ts's own copy.
+APPROVAL_POLICY_FIELDS = ("evaluateApproval", "uploadApproval", "httpAuthApproval")
+
+# The exact three wire strings a *Approval field may hold. Duplicated from
+# approvals.py's own APPROVAL_POLICY_VALUES rather than imported -- state.py
+# must not import approvals.py (approvals.py already imports state.py; a
+# cycle here would break the plugin at load time) -- so this tuple is the
+# actual fail-closed enforcement point, and approvals.py's copy exists only
+# for its own callers' convenience. `test_m2_approvals.py` asserts the two
+# stay identical.
+APPROVAL_POLICY_VALUES = ("always_allow", "ask_per_session", "always_ask")
+
+_APPROVAL_POLICY_DEFAULT = "always_ask"
+
+
+def _power_approval_policy(value: Any) -> str:
+    """Strict enum parse for one *Approval field: only an EXACT match against
+    one of APPROVAL_POLICY_VALUES survives. Anything else -- absent, `None`,
+    a bool, a number, an unrecognised string, a stored value from a future
+    version with a fourth option this gateway doesn't know -- reads as
+    `_APPROVAL_POLICY_DEFAULT` ("always_ask"), the safe fallback per
+    ep1-contract.md: "Missing / corrupt / unknown reported value ... ->
+    always_ask. Never allow."
+    """
+    return value if value in APPROVAL_POLICY_VALUES else _APPROVAL_POLICY_DEFAULT
+
+
 def get_power_policy(device_id: str) -> Dict[str, Any]:
     """The power policy `device_id` most recently reported: one bool per
     POWER_KINDS plus `uploadRoots`/`maxUploadBytes`. A device this table has
@@ -1746,6 +1777,8 @@ def get_power_policy(device_id: str) -> Dict[str, Any]:
         policy: Dict[str, Any] = {kind: False for kind in POWER_KINDS}
         policy["uploadRoots"] = ""
         policy["maxUploadBytes"] = 0
+        for field in APPROVAL_POLICY_FIELDS:
+            policy[field] = _APPROVAL_POLICY_DEFAULT
         return policy
     try:
         stored = json.loads(row["policy"])
@@ -1756,6 +1789,8 @@ def get_power_policy(device_id: str) -> Dict[str, Any]:
     policy = {kind: _power_enabled(stored.get(kind)) for kind in POWER_KINDS}
     policy["uploadRoots"] = _power_upload_roots(stored.get("uploadRoots"))
     policy["maxUploadBytes"] = _power_max_upload_bytes(stored.get("maxUploadBytes"))
+    for field in APPROVAL_POLICY_FIELDS:
+        policy[field] = _power_approval_policy(stored.get(field))
     return policy
 
 
@@ -1773,14 +1808,16 @@ def set_power_policy(device_id: str, reported: Dict[str, Any]) -> Dict[str, Any]
     types before this function sees it, so this is the actual enforcement
     point, not the schema declaration.
 
-    Returns the resulting policy (always all nine kinds plus the two bound
-    fields) so callers can diff it against a `get_power_policy()` taken
+    Returns the resulting policy (always all nine kinds, the two bound
+    fields, and the three EP1 approval-policy fields) so callers can diff it against a `get_power_policy()` taken
     before the call and audit the change — see relay.py's hello/heartbeat/
     state.report handlers.
     """
     policy: Dict[str, Any] = {kind: _power_enabled(reported.get(kind)) for kind in POWER_KINDS}
     policy["uploadRoots"] = _power_upload_roots(reported.get("uploadRoots"))
     policy["maxUploadBytes"] = _power_max_upload_bytes(reported.get("maxUploadBytes"))
+    for field in APPROVAL_POLICY_FIELDS:
+        policy[field] = _power_approval_policy(reported.get(field))
     now = _now()
     with _lock:
         conn = connect()

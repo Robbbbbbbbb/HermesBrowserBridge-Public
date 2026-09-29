@@ -10,7 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict
 
-VERSION = "0.2.4"
+VERSION = "0.2.7"
 
 # Silent Fetch rev 2 §2: a correctness-only sanity ceiling on
 # silent_fetch.max_bytes_cap/max_buffered_bytes -- config.yaml may raise
@@ -31,6 +31,14 @@ SILENT_FETCH_SANITY_MAX_BYTES = 2 * 1024 * 1024 * 1024
 # gateway thread indefinitely.
 SILENT_FETCH_MIN_BOOTSTRAP_TIMEOUT_MS = 5000
 SILENT_FETCH_MAX_BOOTSTRAP_TIMEOUT_MS = 120000
+
+# EP2: bounds for silent_evaluate.max_timeout_ms (a per-call timeout_ms is
+# clamped to [MIN, the configured max]; the configured max itself is clamped to
+# [MIN, SANITY_MAX]). 600000 is the extension's own clamp: config may lower it, never raise past what the extension honours.
+SILENT_EVAL_MIN_TIMEOUT_MS = 1000
+SILENT_EVAL_SANITY_MAX_TIMEOUT_MS = 600_000
+# Floor for silent_evaluate.max_spill_bytes.
+SILENT_EVAL_MIN_SPILL_BYTES = 1024
 
 DEFAULTS: Dict[str, Any] = {
     "enabled": True,
@@ -190,6 +198,21 @@ DEFAULTS: Dict[str, Any] = {
         # total size ceiling, pruned oldest-first on write.
         "cache_retention_hours": 24,
         "cache_max_bytes": 500 * 1024 * 1024,
+    },
+    # ep2-silent-evaluate.md: browser_bridge_silent_evaluate. Nested like
+    # silent_fetch; read through silent_evaluate.silent_evaluate_config(),
+    # which clamps every value.
+    "silent_evaluate": {
+        # Gateway-wide switch for the tool. The lane itself is still gated by
+        # silent_fetch.enabled as well.
+        "enabled": True,
+        # Ceiling on a per-call timeout_ms (the Tesla-style sweep runs ~5 min).
+        "max_timeout_ms": 600000,
+        # Ceiling on a spill_to_path result; never above silent_fetch.max_bytes_cap.
+        "max_spill_bytes": 16 * 1024 * 1024,
+        # Directory spill_to_path file names are written into. None means
+        # STATE_DIR / "eval_spill".
+        "spill_dir": None,
     },
 }
 

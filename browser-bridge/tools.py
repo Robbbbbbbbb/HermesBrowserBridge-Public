@@ -524,6 +524,8 @@ def _origin_of(url: str) -> str:
 _CAPABILITY_POWER_KEYS: Dict[str, Tuple[str, ...]] = {
     "upload": ("allowFileUpload", "allowFileUploadFromAgent"),
     "evaluate": ("allowEvaluate",),
+    # EP2: the hidden-worker evaluate rides the same device toggle as the interactive one.
+    "silent_evaluate": ("allowEvaluate",),
     "console": ("allowConsoleRead",),
     "cookies_write": ("allowCookieWrite",),
     "http_auth": ("allowHttpAuth",),
@@ -573,7 +575,7 @@ def _device_power_denial(device_id: str, capability: str) -> Optional[Tuple[str,
 # asserts the two agree whenever both are present, so drift fails a test
 # instead of silently widening the ceiling.
 _DANGEROUS_CAPABILITIES_FALLBACK = frozenset({
-    "upload", "evaluate", "cookies_write", "http_auth", "dialog", "downloads", "console",
+    "upload", "evaluate", "cookies_write", "http_auth", "dialog", "downloads", "console", "silent_evaluate",
 })
 
 
@@ -758,6 +760,34 @@ def _authorize(
         )
         return reason, protocol.GRANT_DENIED
 
+    # EP1 (ep1-contract.md): the configurable approval policy for
+    # evaluate/upload/http_auth. Consulted ONLY here, after the operator kill
+    # switch, device-power denial, explicit-grant check, and the ordinary
+    # full/off gates above have already run — the policy is strictly a way to
+    # skip a live prompt that would otherwise happen, never a wider grant
+    # than any of those. `check_policy_grant` itself enforces the floor
+    # (mode must be exactly "full"; a 'request'-mode origin always falls
+    # through to `approvals.require` below, prompting every call).
+    relay = relay_mod.get_relay()
+    connection_id = relay.connection_identity(device_id) if relay is not None else ""
+    # Defensive `getattr`, mirroring `_dangerous_capability`'s own skew
+    # handling above: several test suites install a hand-built fake
+    # `hermes_plugin.approvals` module (a `types.ModuleType` carrying only
+    # `require`/`DANGEROUS_CAPABILITIES`/etc.) to exercise `_authorize`'s
+    # live-approval path without a real approval transport. A fake missing
+    # this EP1 addition must degrade to "no policy short-circuit" (i.e.
+    # behave exactly as pre-EP1 `always_ask` would) rather than raising —
+    # the ordinary `approvals.require` call below is what those suites are
+    # actually testing, and a missing attribute here must never abort that.
+    check_policy_grant = getattr(approvals, "check_policy_grant", None)
+    policy_decision = check_policy_grant(device_id, origin, capability, mode, connection_id) if check_policy_grant else None
+    if policy_decision is not None:
+        audit.record(
+            "grant_check", device=device_id, origin=origin, capability=capability, mode=mode,
+            decision="allow", scope=policy_decision.scope, reason=policy_decision.reason,
+        )
+        return None
+
     safe_detail, _ = _gateway_redact(detail, device_id)
     try:
         decision = approvals.require(device_id, origin, capability, summary, session_key, detail=safe_detail)
@@ -776,6 +806,24 @@ def _authorize(
         "grant_check", device=device_id, origin=origin, capability=capability, mode=mode,
         decision="allow" if allowed else "deny", scope=scope, reason=decision_reason,
     )
+    # EP1: an allow answer under an `ask_per_session` policy (mode=="full",
+    # capability in APPROVAL_POLICY_KEYS) creates the in-memory connection-
+    # scoped grant `check_policy_grant` above will find on the NEXT call for
+    # this exact (device, connection, origin, capability) — never persisted,
+    # cleared the moment this connection drops (relay.py's `_drop`). A
+    # `request`-mode origin never reaches here with this policy in effect
+    # (the floor, enforced above), so this never fires for one.
+    policy_keys = getattr(approvals, "APPROVAL_POLICY_KEYS", {})
+    if allowed and mode == "full" and capability in policy_keys and hasattr(approvals, "approval_policy"):
+        # Re-read the connection: a drop during the prompt already ran its clear, so a grant
+        # recorded now under the old id would be an orphan.
+        still_connected = relay is not None and relay.connection_identity(device_id) == connection_id
+        if (
+            still_connected
+            and approvals.approval_policy(device_id, capability) == "ask_per_session"
+            and hasattr(approvals, "grant_policy_session")
+        ):
+            approvals.grant_policy_session(device_id, connection_id, origin, capability)
     if allowed:
         return None
     if scope == "timeout":
@@ -4329,7 +4377,9 @@ def _act_would_need_live_prompt(
         from . import approvals  # noqa: PLC0415 - optional sibling module, workstream H
     except ImportError:
         return False  # _authorize denies outright here too (approval_transport_missing), never a prompt
-    if approvals.has_standing_grant(device_id, holder, origin, capability):
+    relay = relay_mod.get_relay()
+    connection_id = relay.connection_identity(device_id) if relay is not None else ""
+    if approvals.has_standing_grant(device_id, holder, origin, capability, mode=mode, connection_id=connection_id):
         return False
     return True
 
@@ -6022,6 +6072,17 @@ def register_tools(ctx) -> list[str]:
         silent_fetch_tools = silent_fetch_mod.register_silent_fetch_tools(ctx)
         if silent_fetch_tools:
             registered.extend(silent_fetch_tools)
+    except ImportError:
+        pass
+
+    # EP2 (ep2-silent-evaluate.md): browser_bridge_silent_evaluate, JS in the
+    # hidden worker tab. Same defensive seam as silent_fetch above.
+    try:
+        from . import silent_evaluate as silent_evaluate_mod  # noqa: PLC0415 - optional sibling module, see docstring
+
+        silent_evaluate_tools = silent_evaluate_mod.register_silent_evaluate_tools(ctx)
+        if silent_evaluate_tools:
+            registered.extend(silent_evaluate_tools)
     except ImportError:
         pass
 

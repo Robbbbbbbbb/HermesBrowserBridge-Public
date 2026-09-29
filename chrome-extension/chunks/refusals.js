@@ -1,4 +1,4 @@
-const PROTOCOL_VERSION = "1.5";
+const PROTOCOL_VERSION = "1.6";
 const HEARTBEAT_INTERVAL_MS = 2e4;
 const ERROR_CODES = {
   PARSE_ERROR: -32700,
@@ -135,8 +135,12 @@ const ERROR_CODES = {
   // devices.md: the global device priority order is pinned; only the operator (CLI/popup) can change it -- the agent can read it but not reorder it until the user unpins it
   DEVICE_NOT_ALIVE: 4262,
   // devices.md: an explicit or tab/session-bound device target is stale past use or offline (or paused) -- see alive_devices for the alternatives
-  NO_ALIVE_DEVICE: 4263
+  NO_ALIVE_DEVICE: 4263,
   // devices.md: no alive, unpaused device was available for an implicit (device-less) call -- see devices for each candidate's liveness
+  SILENT_EVAL_TIMEOUT: 4264,
+  // ep2-silent-evaluate.md: a silent.evaluate expression did not settle within its timeout (the background-side deadline, not CDP's own); the worker tab was recycled in case a dialog wedged it
+  SILENT_WORKER_BUSY: 4265
+  // ep2-silent-evaluate.md: the hidden worker tab for this origin is already running a silent.fetch or silent.evaluate; calls are single-flight per worker and are rejected, not queued
 };
 const REFUSALS = {
   "power_capability_disabled": { code: "GRANT_DENIED", params: ["capability", "settingNames"], message: "{capability} needs {settingNames} switched on for this device — open the extension's Options page, tick it under Powers, and press Save. Off is the shipped default: both the extension and the gateway refuse this independently before anything is dispatched, and a device that has never reported its settings is treated as having them all off." },

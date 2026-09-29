@@ -19,13 +19,32 @@ outright.
 ## Gating (G0.5, G0.5.4, G0.6.6)
 
 ``evaluate`` is one of ``approvals.py``'s ``DANGEROUS_CAPABILITIES`` AND one
-of the three ``NO_STANDING_GRANT_CAPABILITIES`` (alongside ``upload`` and
-``http_auth``) — ``_authorize`` already refuses ``always``/``session`` for it
+of the three capabilities in ``APPROVAL_POLICY_KEYS`` (alongside ``upload``
+and ``http_auth``) — ``_authorize`` already refuses ``always``/``session`` for it
 before this file does anything (``approvals.require`` never even offers those
-choices; see G0.5.4), and a ``full``-mode origin still prompts (the
-per-capability ceiling, G0.5.3). This file's own job is narrower: build the
-approval summary, capture the expression once, and never let a display/audit
-copy of it diverge from the copy actually sent over the wire.
+choices; see G0.5.4), and a ``full``-mode origin's per-capability ceiling
+(G0.5.3) still routes here rather than short-circuiting the way an ordinary
+capability's ``full`` grant would.
+
+EP1 (ep1-contract.md) layers a configurable, per-device APPROVAL POLICY on
+top of that ceiling: ``evaluateApproval`` (one of ``always_allow`` /
+``ask_per_session`` / ``always_ask``), read via ``approvals.approval_policy``
+and applied in ``_authorize`` ONLY when the origin's mode is ``full`` (the
+floor — a ``request``-mode origin still prompts every call, whatever the
+device reports). ``always_allow`` skips the prompt entirely; ``ask_per_session``
+prompts once per relay connection and reuses an in-memory grant after that;
+``always_ask`` is the unmodified pre-EP1 behaviour. The extension's own
+default for ``evaluateApproval`` is ``always_allow`` (set in Options next to
+the ``allowEvaluate`` toggle, which is on by default on a fresh install); a device that
+never reports the field, or reports something missing/corrupt, falls back
+gateway-side to ``always_ask`` instead — a different thing from the
+extension default. None of this changes what host-side grant machinery this
+capability can hold (still none — membership in ``APPROVAL_POLICY_KEYS`` is
+exactly what rules that out), and every mode still writes the same
+``tool_evaluate`` audit line below. This
+file's own job is narrower: build the approval summary, capture the
+expression once, and never let a display/audit copy of it diverge from the
+copy actually sent over the wire.
 
 ## Why the expression goes in ``summary``, not ``detail``
 
@@ -80,6 +99,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from typing import Any, Dict, List, Tuple
 
 from . import audit, protocol
@@ -185,9 +205,17 @@ EVALUATE_SCHEMA = {
         "world:'main' (the only world available) gives full read/write access to document.cookie, "
         "localStorage/sessionStorage, and lets you call fetch() with the page's own session — it is a "
         "SUPERSET of browser_bridge_fetch/cookies/cookies_write combined, and using it makes those "
-        "three gates advisory for this origin. Off by default (allowEvaluate), and unlike every other "
-        "capability here it NEVER gets a standing approval — every single call prompts the user, shown "
-        "the exact code that will run, even on an origin already set to 'full'. returnByValue is always "
+        "three gates advisory for this origin. On by default on a fresh install (allowEvaluate); a device that never reported its power policy counts as off. Approval is governed by "
+        "the device's evaluateApproval setting (Options popup, defaults to 'always_allow' there): "
+        "'always_ask' (the gateway's fallback for a device that never reports the field, or reports "
+        "something missing/corrupt) prompts the user every call, shown the exact code that will run, even on an origin "
+        "already set to 'full'; 'ask_per_session' prompts once per browser connection and then stays "
+        "silent for the rest of it; 'always_allow' never prompts. The policy only applies on an origin "
+        "already set to 'full' — a 'request'-mode origin always prompts every call regardless of the "
+        "device's setting, and a standing 'always'/'session' grant can never be earned for this "
+        "capability the way it can for most others. Every call is audited (expression, device, origin, "
+        "timing, result) whichever mode is in effect — the audit trail, not a live prompt, is what makes "
+        "an 'always_allow' evaluate call reviewable after the fact. returnByValue is always "
         "used: you get a serialised result back (capped at 32KB, redacted for card/SSN/email/phone/"
         "password/bearer-token/JWT/API-key shapes), never a live handle into the page. Every call has a "
         "hard timeout (default 10s, max 30s) — if the expression opens a dialog, loops forever, or "
@@ -264,6 +292,13 @@ def handle_evaluate(args: Dict[str, Any], **kwargs: Any) -> str:
     summary = f"run custom JS in tab {tab_id} at {origin}:\n{display_expression}"
     detail = json.dumps({"expression": display_expression, "timeout_ms": timeout_ms})
 
+    # EP1: audit is the compensation for a prompt the approval policy may
+    # have just skipped (docs/security.md) — every mode's `tool_evaluate*`
+    # audit line carries `elapsed_ms`, measured from right before
+    # `_authorize` (so the approval wait itself, when there is one, counts)
+    # through the call's own resolution, success or failure alike.
+    call_start = time.monotonic()
+
     denial = tools_mod._authorize(
         device_id, origin, "evaluate",
         summary=summary,
@@ -274,7 +309,7 @@ def handle_evaluate(args: Dict[str, Any], **kwargs: Any) -> str:
         reason, code = denial
         audit.record(
             "tool_evaluate_denied", device=device_id, tab_id=tab_id, origin=origin,
-            expression=display_expression,
+            expression=display_expression, elapsed_ms=round((time.monotonic() - call_start) * 1000.0, 1),
         )
         return tools_mod._err(reason, code=code, device_id=device_id, tab_id=tab_id, origin=origin)
 
@@ -290,6 +325,7 @@ def handle_evaluate(args: Dict[str, Any], **kwargs: Any) -> str:
         audit.record(
             "tool_evaluate", device=device_id, holder=holder, tab_id=tab_id, origin=origin,
             expression=display_expression, timeout_ms=timeout_ms, ok=False,
+            elapsed_ms=round((time.monotonic() - call_start) * 1000.0, 1),
         )
         return tools_mod._bridge_err(exc, "page.evaluate")
 
@@ -306,6 +342,7 @@ def handle_evaluate(args: Dict[str, Any], **kwargs: Any) -> str:
         "tool_evaluate", device=device_id, holder=holder, tab_id=tab_id, origin=origin,
         expression=display_expression, timeout_ms=timeout_ms, ok=True,
         result_truncated=bool(result.get("truncated")), redactions=gateway_hits,
+        elapsed_ms=round((time.monotonic() - call_start) * 1000.0, 1),
     )
     return tools_mod._ok(
         device_id=device_id,

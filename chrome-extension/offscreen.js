@@ -1009,6 +1009,9 @@ const PAUSABLE_METHODS = /* @__PURE__ */ new Set([
   // must not have arbitrary code running against their page any more than
   // page.act may act on it.
   "page.evaluate",
+  // EP2: silent.evaluate runs the same arbitrary code, in a hidden worker
+  // tab of the user's logged-in session — a paused user must not have it run.
+  "silent.evaluate",
   // Opening a tab is the most side-effectful thing the gateway can ask for:
   // a paused user must not find new tabs appearing.
   "tabs.create",
@@ -1587,6 +1590,23 @@ async function dispatchInbound(method, params, id) {
         fetchImpl: params.fetch_impl === "native" ? "native" : params.fetch_impl === "page" ? "page" : void 0
       });
       return requireOk(result, ERROR_CODES.SILENT_WORKER_LAUNCH_FAILED, "silent.fetch failed");
+    }
+    case "silent.evaluate": {
+      const result = await delegate({
+        target: "background",
+        type: "silent.evaluate",
+        requestId: id ?? 0,
+        url: typeof params.url === "string" ? params.url : "",
+        expression: typeof params.expression === "string" ? params.expression : "",
+        world: typeof params.world === "string" ? params.world : void 0,
+        timeoutMs: typeof params.timeout_ms === "number" ? params.timeout_ms : void 0,
+        awaitPromise: typeof params.await_promise === "boolean" ? params.await_promise : void 0,
+        maxReturnBytes: typeof params.max_return_bytes === "number" ? params.max_return_bytes : void 0,
+        spill: typeof params.spill === "boolean" ? params.spill : void 0,
+        maxSpillBytes: typeof params.max_spill_bytes === "number" ? params.max_spill_bytes : void 0,
+        bootstrapTimeoutMs: typeof params.bootstrap_timeout_ms === "number" ? params.bootstrap_timeout_ms : void 0
+      });
+      return requireOk(result, ERROR_CODES.SILENT_WORKER_LAUNCH_FAILED, "silent.evaluate failed");
     }
     case "silent.kill": {
       const result = await delegate({

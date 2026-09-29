@@ -129,6 +129,54 @@ code path this comes from.
 - **Timeout** (nobody answered within the TTL, default 120s) — treated
   identically to `deny`. Never defaults to allow.
 
+## EP1: a second, orthogonal dimension for evaluate / upload / http_auth
+
+Everything in the table above is about the **origin's mode**. For exactly
+three capabilities — `evaluate` (`browser_bridge_evaluate`), `upload`
+(`browser_bridge_upload`), and `http_auth`
+(`browser_bridge_http_auth_status`) — there is a SECOND, per-device setting
+that layers on top of `full` mode: the **approval policy**
+(`evaluateApproval` / `uploadApproval` / `httpAuthApproval`, set in the
+extension's Options page next to each capability's own on/off toggle). These
+three can never hold a standing `always`/`session` grant the way `act`/
+`fetch`/`cookies`/etc. can (the table above's approval-scope rules don't
+apply to them at all) — the approval policy is the only lever for whether an
+individual call still prompts.
+
+| Policy | What happens on a `full`-mode origin | On a `request`-mode origin |
+|---|---|---|
+| `always_allow` | No prompt, ever. Still fully audited — the audit line is what you'd review instead of a prompt. | Ignored — **the floor**: `request` mode always prompts every call regardless of this setting. |
+| `ask_per_session` | The first call on a given device+relay-connection+origin+capability prompts; any allow answer silences the rest of that connection's calls. Reconnecting the extension (or restarting the gateway) resets it — you'll be asked again. | Ignored — same floor as above. |
+| `always_ask` | Every call prompts — the original, pre-EP1 behaviour. | Every call prompts (no change from the floor). |
+
+Because a never-configured origin's effective mode is `full` (`default_mode`
+ships as `full` — see above), the extension-reported policy is what actually
+governs an unconfigured origin out of the box, not `request`'s per-call
+floor.
+
+The extension's own default differs per capability, set in Options next to
+each toggle: `evaluateApproval` defaults to `always_allow`, while
+`uploadApproval` and `httpAuthApproval` default to `ask_per_session`. Run JavaScript
+(`allowEvaluate`) is likewise on by default on a fresh install, so out of the box
+the agent's JavaScript runs on Full-access and zero-touch origins with no
+prompt (every call audited); an install that stored it off keeps it off. That's
+a fresh-install/fresh-storage default, and it's distinct from the gateway's
+fallback for a device that never reports the field at all (an extension
+older than 0.2.5) or reports something missing/corrupt: that always reads as
+`always_ask` — the same fail-closed direction every other unknown-power-policy
+field in this project takes. See `security.md`'s "EP1: configurable approval
+policy" section for the full mechanism (audit fields, the connection-scoped
+grant's exact lifetime, what does and doesn't change about the host grant
+refusal).
+
+## Background requests and agent JavaScript (EP2)
+
+Background requests now also permits agent JS in the hidden worker, when Run
+JavaScript is on. An origin set to Always allow runs `browser_bridge_silent_evaluate`
+under the device's `evaluateApproval` policy; an origin set to Ask first prompts
+on every evaluation regardless of that policy. Details:
+[`silent-evaluate.md`](silent-evaluate.md).
+
 ## Picking a mode for a site, in practice
 
 - **A site you want Hermes to actively work in** (an admin console you're

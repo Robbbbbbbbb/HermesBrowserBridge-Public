@@ -1,7 +1,7 @@
 ---
 name: browser-bridge
 description: Drive the user's shared Chrome tabs through the Browser Bridge.
-version: 0.2.4
+version: 0.2.7
 author: Robbbbbbbbb
 homepage: https://github.com/Robbbbbbbbb/HermesBrowserBridge-Public
 license: MIT
@@ -134,6 +134,7 @@ writing the workaround down as a lesson.
 | Resolve/answer a native `alert`/`confirm`/`prompt`/`beforeunload` | `browser_bridge_dialog` |
 | Replay an authenticated API call (the cURL-killer) | `browser_bridge_fetch` |
 | Bulk/paginated fetch against a granted origin, no tab needed | `browser_bridge_silent_fetch` |
+| Loop/batch/aggregate JS in the background, no tab needed (one call for a whole sweep) | `browser_bridge_silent_evaluate` |
 | See what requests the page itself made (metadata, sometimes bodies) | `browser_bridge_network` |
 | Read cookie presence/metadata, or a value if you truly need it | `browser_bridge_cookies` |
 | Write/overwrite a cookie | `browser_bridge_cookie_set` |
@@ -503,27 +504,42 @@ rather not click through every step:
 Seven capabilities get a **ceiling above `full`**: even a `full`-mode origin
 still prompts for them, because a broad "allow this whole site" grant was
 never meant to cover these. Each also needs its own **device-side toggle**
-(Options → Powers, all off by default except dialog-dismiss and
-downloads-read) — without it, the call is refused before an approval is ever
+(Options → Powers, all off by default except dialog-dismiss,
+downloads-read and Run JavaScript on a fresh install) — without it, the call is refused before an approval is ever
 raised, and the refusal names the toggle to point the user at. **Never look
 for a way around a refusal** — tell the user which toggle to flip, or that the
 capability is denied fleet-wide by the operator.
 
 Three of the seven — **upload, evaluate, http auth** — can **never** get a
-standing grant at all: not `always`, not even `session`. A file handed to a
-site, arbitrary code execution, and a saved sign-in credential are not things
-one click can pre-authorize for later, so every single call prompts, forever,
-on every origin.
+*host-side* standing grant at all: not `always`, not even `session`. A file
+handed to a site, arbitrary code execution, and a saved sign-in credential
+are not things one click's `always`/`session` answer can pre-authorize for
+later. Whether an individual call still prompts is instead governed by each
+capability's own per-device **approval policy** (`evaluateApproval` /
+`uploadApproval` / `httpAuthApproval`, an Options-page setting next to each
+capability's own on/off toggle): `always_ask` prompts every call;
+`ask_per_session` prompts once per browser connection and then stays quiet;
+`always_allow` never prompts. The extension's own default differs per
+capability (see the table below) — `evaluateApproval` defaults to
+`always_allow`, `uploadApproval`/`httpAuthApproval` default to
+`ask_per_session`. This policy only applies on an origin already
+set to `full` — an origin sitting at `request` mode always prompts every
+call regardless of it. A device that never reports the field, or reports a
+missing/unrecognised value, falls back gateway-side to `always_ask`
+(distinct from any extension default). Every call is fully audited (expression/filename/origin,
+device, timing, result) no matter which mode is in effect — if a capability
+you expected to prompt didn't, that's very likely `always_allow`, not a bug;
+check the device's Approval setting before assuming otherwise.
 
-| Capability | Tool(s) | Toggle (default) | Standing grant? |
-|---|---|---|---|
-| Upload | `browser_bridge_upload` | `allowFileUpload` / `allowFileUploadFromAgent` (off) | Never |
-| Evaluate | `browser_bridge_evaluate` | `allowEvaluate` (off) | Never |
-| HTTP auth | `browser_bridge_http_auth_status` (read-only; arming is user-only) | `allowHttpAuth` (off) | Never |
-| Console | `browser_bridge_console` | `allowConsoleRead` (off) | once/session/always |
-| Cookie write | `browser_bridge_cookie_set` | `allowCookieWrite` (off) | once/session/always |
-| Downloads | `browser_bridge_downloads` | `allowDownloadsRead` (**on**) | once/session/always |
-| Dialog accept | `browser_bridge_dialog` (`accept: true`) | `allowDialogAccept` (off) | once/session/always |
+| Capability | Tool(s) | Toggle (default) | Host-side standing grant? | Approval policy setting (default) |
+|---|---|---|---|---|
+| Upload | `browser_bridge_upload` | `allowFileUpload` / `allowFileUploadFromAgent` (off) | Never | `uploadApproval` (`ask_per_session`) |
+| Evaluate | `browser_bridge_evaluate` | `allowEvaluate` (**on** on a fresh install; a device that never reported it counts as off) | Never | `evaluateApproval` (`always_allow`) |
+| HTTP auth | `browser_bridge_http_auth_status` (read-only; arming is user-only) | `allowHttpAuth` (off) | Never | `httpAuthApproval` (`ask_per_session`) |
+| Console | `browser_bridge_console` | `allowConsoleRead` (off) | once/session/always | n/a |
+| Cookie write | `browser_bridge_cookie_set` | `allowCookieWrite` (off) | once/session/always | n/a |
+| Downloads | `browser_bridge_downloads` | `allowDownloadsRead` (**on**) | once/session/always | n/a |
+| Dialog accept | `browser_bridge_dialog` (`accept: true`) | `allowDialogAccept` (off) | once/session/always | n/a |
 
 - **Upload** — pick a file for an `<input type=file>`. Tier 1 (`file_path`,
   an absolute path on the *browser's own host*, under `uploadRoots`) or tier 2
@@ -536,7 +552,8 @@ on every origin.
   allowed" as "those three gates are advisory here." If refused, that's the
   correct, final answer — do not try to reach the same effect through
   `browser_bridge_fetch`/`cookies` instead; ask the user to enable
-  `allowEvaluate` if the task truly needs it.
+  `allowEvaluate` if the task truly needs it (it is on by default on a fresh
+  install, so a refusal usually means it was turned off or never reported).
 - **HTTP auth status** — read-only: tells you whether a credential is armed
   for an origin so you can stop retrying a 401 and tell the user to open the
   popup (Options → HTTP sign-in) and stage one themselves. This tool can never
@@ -873,6 +890,63 @@ what to tell the user for each.
 Full reference and a worked paging example: `skill_view('browser-bridge',
 file_path='references/headless-fetch.md')`.
 
+### 9g. Using exported sessions from the gateway host
+
+Decision procedure for small jobs against an edge-protected origin. Full
+write-up: `docs/session-export.md`.
+
+1. **Is it a small burst?** A few dozen requests: consider a session export.
+   Long or unattended sweep: use `browser_bridge_silent_fetch` instead.
+2. **Has the user's browser passed the origin's first visit?** The exported
+   session is only meaningful after the paired browser has loaded the site and
+   cleared its first-load checks. If not, have the user open the site first.
+3. **Pull cookies once:** `browser_bridge_cookies` with `include_values: true`
+   (needs the `cookies` grant). Write the values to a temp file with mode 0600.
+   Values never enter the conversation, chat, or logs.
+4. **Run N local requests from the gateway host with a Chrome-compatible HTTP
+   client, sending the exported cookies.** One cookie pull plus N local
+   requests costs less context and less of the rate bucket than N bridge round
+   trips.
+5. **Both pieces are required together.** Edge-protection sites check transport
+   characteristics and session state at the same time; the cookies alone, or
+   the client alone, fails.
+6. **Refresh discipline:** cookie metadata exposes expiries (`bm_sz` is about
+   2 hours on Akamai-fronted sites). Re-export before expiry. On a 403, retry
+   once with a fresh export. Persistent 429 or challenge HTML means the site
+   wants its own browser for this job: switch to `browser_bridge_silent_fetch`.
+   Do not hammer.
+7. **Security posture is unchanged:** cookie values are redacted from audit and
+   gated by the `cookies` capability grant. Delete the temp file when done.
+
+If a silent call fails `SILENT_WORKER_BUSY` (4265) after an earlier one timed out, retry once (the gateway reclaims the stuck worker) or call `browser_bridge_silent_kill` with the origin.
+
+### 9h. Batch it in one `browser_bridge_silent_evaluate`, spill the result
+
+Use this when the job is "do the same request N times and combine the
+answers". Do NOT make N `silent_fetch` calls: put the loop inside one
+expression, run it in the hidden worker, and keep the bulk out of your
+context.
+
+1. Write the whole loop as one async IIFE (max 4096 chars): fetch the id
+   list, loop with a short `await` delay between requests, collect rows,
+   return the array.
+2. Pass `spill_to_path` (a plain file NAME such as `sweep-1.json`, no slashes)
+   and a `timeout_ms` above the expected runtime (default 30000, max
+   normally 600000).
+3. The reply is `{path, bytes, sha256, preview}` — read `path` with
+   `execute_code`; do not ask for the data inline (inline results are capped
+   at `max_return_bytes`, default 32 KB, `truncated: true` when cut).
+4. The rate guard counts bridge calls, not the page's own `fetch()` calls, so
+   pace the loop yourself if the site limits requests.
+
+Needs the origin's "Background requests" grant AND the device's Run JavaScript
+setting. On a zero-touch origin (Background requests Always, or the defaults) the
+agent's JS runs with no prompt. `4265` = a fetch/evaluation is still running on
+that origin's worker; refused at once, never queued: wait and retry. `4264` = the expression outlived `timeout_ms` or opened a
+dialog (never call `alert`/`confirm`/`prompt`); the worker was recycled, so
+raise `timeout_ms` or split the job. `status: "error"` with an `exception` is
+your expression throwing, not a bridge failure. Full guide: `docs/silent-evaluate.md`.
+
 ## 10. `browser_bridge_downloads` → `browser_bridge_upload`
 
 `browser_bridge_downloads` (`tab_id`, optional `filter`/`limit`/`waitMs`)
@@ -915,7 +989,12 @@ see §5 for why this makes fetch/cookies/cookie-write advisory once it's on.
   approval prompt and audit log both need to stay readable.
 - `world` values other than `"main"` are refused (`EVAL_WORLD_UNSUPPORTED`,
   4224) — isolated-world evaluation isn't shipped.
-- See §5: this always prompts, on every call, on every origin, even `full`.
+- See §5: this can never earn a host-side standing grant. Whether an
+  individual call still prompts is the device's `evaluateApproval` setting
+  (default `always_allow`) — assume it may run unattended unless you know
+  the device's Options page says otherwise, and never assume "it ran without
+  asking" means anything went unaudited: every call still writes a full
+  `tool_evaluate` audit line regardless.
 
 ## 12. `browser_bridge_http_auth_status`
 
@@ -1032,6 +1111,8 @@ user something you could resolve yourself from `browser_bridge_status`.
 | 4261 | `DEVICE_PRIORITY_PINNED` | devices.md: an agent write tried to reorder the GLOBAL device priority order while the user has it pinned. → Set a session-scoped override instead (never pinned), or ask the user to unpin it. |
 | 4262 | `DEVICE_NOT_ALIVE` | devices.md: an explicit `device_id`/name, or the device this session or tab-bound call is already pinned to, is offline or paused. → Never fails over silently; check `alive_devices` in the error and either wait for it to reconnect or retry a device-less call without `device_id`. |
 | 4263 | `NO_ALIVE_DEVICE` | devices.md: an implicit (device-less) call found no alive, unpaused device among every paired one. → Check `devices` in the error and ask the user to reconnect or resume sharing on one of them. |
+| 4264 | `SILENT_EVAL_TIMEOUT` | EP2: a `browser_bridge_silent_evaluate` expression outlived `timeout_ms` (or opened a dialog); the worker tab was recycled. → Raise `timeout_ms` (up to the gateway's `silent_evaluate.max_timeout_ms`), await only promises that settle, never call `alert`/`confirm`/`prompt`. |
+| 4265 | `SILENT_WORKER_BUSY` | EP2: the origin's hidden worker is still running a `silent_fetch` or `silent_evaluate`; calls are single-flight, not queued. → Wait for it to finish, then retry. |
 | 4300 | `TIMEOUT` | Operation timed out (often a wedged dialog). → Resolve any open dialog, then retry. |
 
 `TOKEN_INVALID`/`TOKEN_REVOKED`/`PAIR_CODE_*`/`RATE_LIMITED`/`SEQ_GAP`/

@@ -440,6 +440,18 @@ line (device, origin, `action`, `reason`); an unrecognized `action` instead
 writes `silent_worker_rejected`. See `security.md` §24 / `silent-fetch.md`
 §4 for the full event/action table.
 
+### Every silent call to one origin fails with `SILENT_WORKER_BUSY` (4265) after an earlier timeout
+
+The earlier `silent.fetch`/`silent.evaluate` hung in the extension and the
+gateway gave up (`TIMEOUT`, 4300), leaving that origin's hidden worker marked
+busy. Current gateways send `silent.kill {origin}` themselves after such a
+timeout (and once on a 4265 they did not cause) — look for `silent_worker_reclaim`
+lines in the audit log — so a single retry gets a fresh worker. If the
+reclaim reports `sent: false` (device offline), call
+`browser_bridge_silent_kill` once the device is back. The CLI
+`hermes browser-bridge silent kill ORIGIN` only works when the relay runs in
+that same process, which a normal shell does not. See `silent-fetch.md` §8.
+
 ## File upload (G1.3)
 
 ### `browser_bridge_upload` (tier 1, a local path) fails with "this extension's 'Allow access to file URLs' toggle is off" (`UPLOAD_FILE_URL_ACCESS_DISABLED`, 4223)
